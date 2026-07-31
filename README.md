@@ -7,11 +7,11 @@
 | Pin Pantalla | Pin ESP32 | Función       |
 |-------------|-----------|---------------|
 | BLK         | 3.3V      | Backlight     |
-| DC          | GPIO 16   | Data/Command  |
-| CS          | GPIO 5    | Chip Select   |
-| RES         | GPIO 17   | Reset         |
-| SDA         | GPIO 23   | Data SPI (MOSI) |
-| SCL         | GPIO 18   | Clock SPI (SCK) |
+| DC          | GPIO 16 (RX2) | Data/Command  |
+| CS          | GPIO 5        | Chip Select   |
+| RES         | GPIO 17 (TX2) | Reset         |
+| SDA         | GPIO 23       | Data SPI (MOSI) |
+| SCL         | GPIO 18       | Clock SPI (SCK) |
 | VCC         | 3.3V      | Alimentación  |
 | GND         | GND       | Tierra        |
 
