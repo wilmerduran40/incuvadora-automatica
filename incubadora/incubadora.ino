@@ -95,7 +95,7 @@ const float HUM_MAX_LOCKDOWN = 70.0;
 
 // Temperatura constante todo el ciclo
 float tempObjetivo = 37.5;
-const float TEMP_MIN      = 37.2;
+const float TEMP_MIN      = 37.5;
 const float TEMP_MAX      = 37.8;
 
 // ===================== VARIABLES DE ESTADO =====================
