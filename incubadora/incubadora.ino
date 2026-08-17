@@ -36,6 +36,7 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <time.h>
+#include <esp_task_wdt.h>
 
 // ===================== PINES =====================
 constexpr unsigned int PIN_DHT22       = 4;
@@ -81,8 +82,8 @@ const unsigned long DURACION_VOLTEO     = 20000UL;
 const unsigned long INTERVALO_LECTURA   = 2000UL;
 const unsigned long INTERVALO_PANTALLA  = 1000UL;
 const unsigned long INTERVALO_GUARDADO  = 60000UL;
-const unsigned long INTERVALO_BOT       = 3000UL;
-const unsigned long INTERVALO_RECONEXION_WIFI = 15000UL;
+const unsigned long INTERVALO_BOT       = 5000UL;
+const unsigned long INTERVALO_RECONEXION_WIFI = 30000UL;
 const int DIAS_INCUBACION              = 21;
 const int DIA_LOCKDOWN                  = 18;
 
@@ -186,6 +187,7 @@ const char DASHBOARD_HTML[] PROGMEM =
 // ===================== PERSISTENCIA (PROTECCION CORTE) =====================
 
 void guardarEstado() {
+  esp_task_wdt_reset();
   preferences.begin("incubadora", false);
 
   unsigned long uptimeTotal = uptimeAcumulado + millis();
@@ -195,6 +197,7 @@ void guardarEstado() {
   preferences.putBool("manHum", manualHum);
 
   preferences.end();
+  esp_task_wdt_reset();
   Serial.println(F("Estado guardado."));
 }
 
@@ -281,8 +284,11 @@ void gestionarWifi() {
 
   Serial.print(F("Reconectando WiFi: "));
   Serial.println(wifiSsid);
-  WiFi.disconnect();
-  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  // No hace falta disconnect + begin constante; setAutoReconnect ya intenta reconectar.
+  // Forzamos un begin solo si no hay intento de reconexion activo.
+  if (WiFi.status() == WL_DISCONNECTED || WiFi.status() == WL_NO_SSID_AVAIL) {
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  }
 }
 
 void mostrarEstadoWifi() {
@@ -470,10 +476,24 @@ void verificarVolteo(unsigned long ahora) {
 }
 
 void leerSensor() {
+  unsigned long t0 = millis();
   auto status = am2302.read();
+  unsigned long duracion = millis() - t0;
+
   if (status == AM2302::AM2302_READ_OK) {
     temperatura = am2302.get_Temperature();
     humedad = am2302.get_Humidity();
+    if (duracion > 500) {
+      Serial.print(F("Lectura DHT lenta: "));
+      Serial.print(duracion);
+      Serial.println(F(" ms"));
+    }
+  } else {
+    Serial.print(F("ERROR DHT ("));
+    Serial.print(status);
+    Serial.print(F("), duracion "));
+    Serial.print(duracion);
+    Serial.println(F(" ms"));
   }
 }
 
@@ -571,21 +591,51 @@ void mostrarInfoSerial() {
 }
 
 String obtenerInfoTelegram() {
-  String s;
-  s += "INCUBADORA AUTOMATICA\n";
-  s += "Dia: " + String(diaActual) + "/" + String(DIAS_INCUBACION) + "\n";
-  s += "Fase: " + String(enLockdown ? "LOCKDOWN (eclosion)" : "DESARROLLO") + "\n";
-  s += "Temp: " + String(temperatura, 1) + "C (obj " + String(tempObjetivo, 1) + "C)\n";
-  s += "Hum: " + String(humedad, 1) + "% (obj " + String(obtenerHumMin(), 0) + "-" + String(obtenerHumMax(), 0) + "%)\n";
-  s += "Calefactor: " + String(estadoCalefactor ? "ON" : "OFF") + "\n";
-  s += "Humificador: " + String(estadoHumificador ? "ON" : "OFF") + "\n";
-  s += "Motor: " + String(motorVolteando ? "GIRANDO" : "OFF") + "\n";
+  char buf[512];
+  unsigned long uptimeH = obtenerUptimeTotal() / 3600000UL;
   if (!enLockdown) {
     unsigned long rest = calcularTiempoVolteo();
-    s += "Prox. volteo: " + String(rest / 3600) + "h " + String((rest % 3600) / 60) + "m\n";
+    snprintf(buf, sizeof(buf),
+      "INCUBADORA AUTOMATICA\n"
+      "Dia: %d/%d\n"
+      "Fase: %s\n"
+      "Temp: %.1fC (obj %.1fC)\n"
+      "Hum: %.1f%% (obj %.0f-%.0f%%)\n"
+      "Calefactor: %s\n"
+      "Humificador: %s\n"
+      "Motor: %s\n"
+      "Prox. volteo: %luh %lum\n"
+      "Uptime: %luh",
+      diaActual, DIAS_INCUBACION,
+      enLockdown ? "LOCKDOWN (eclosion)" : "DESARROLLO",
+      temperatura, tempObjetivo,
+      humedad, obtenerHumMin(), obtenerHumMax(),
+      estadoCalefactor ? "ON" : "OFF",
+      estadoHumificador ? "ON" : "OFF",
+      motorVolteando ? "GIRANDO" : "OFF",
+      rest / 3600, (rest % 3600) / 60,
+      uptimeH);
+  } else {
+    snprintf(buf, sizeof(buf),
+      "INCUBADORA AUTOMATICA\n"
+      "Dia: %d/%d\n"
+      "Fase: %s\n"
+      "Temp: %.1fC (obj %.1fC)\n"
+      "Hum: %.1f%% (obj %.0f-%.0f%%)\n"
+      "Calefactor: %s\n"
+      "Humificador: %s\n"
+      "Motor: %s\n"
+      "Uptime: %luh",
+      diaActual, DIAS_INCUBACION,
+      enLockdown ? "LOCKDOWN (eclosion)" : "DESARROLLO",
+      temperatura, tempObjetivo,
+      humedad, obtenerHumMin(), obtenerHumMax(),
+      estadoCalefactor ? "ON" : "OFF",
+      estadoHumificador ? "ON" : "OFF",
+      motorVolteando ? "GIRANDO" : "OFF",
+      uptimeH);
   }
-  s += "Uptime: " + String(obtenerUptimeTotal() / 3600000UL) + "h";
-  return s;
+  return String(buf);
 }
 
 String obtenerAyudaTelegram() {
@@ -632,24 +682,39 @@ void handleRoot() {
 }
 
 void handleStatus() {
-  String json = "{";
-  json += "\"temp\":" + String(temperatura, 1) + ",";
-  json += "\"hum\":" + String(humedad, 1) + ",";
-  json += "\"temp_obj\":" + String(tempObjetivo, 1) + ",";
-  json += "\"hum_min\":" + String(obtenerHumMin(), 1) + ",";
-  json += "\"hum_max\":" + String(obtenerHumMax(), 1) + ",";
-  json += "\"cal\":" + String(estadoCalefactor ? "true" : "false") + ",";
-  json += "\"humidor\":" + String(estadoHumificador ? "true" : "false") + ",";
-  json += "\"motor\":" + String(motorVolteando ? "true" : "false") + ",";
-  json += "\"dia\":" + String(diaActual) + ",";
-  json += "\"fase\":\"" + String(enLockdown ? "LOCKDOWN" : "DESARROLLO") + "\",";
-  json += "\"lockdown\":" + String(enLockdown ? "true" : "false") + ",";
-  json += "\"volteo_restante\":" + String(calcularTiempoVolteo()) + ",";
-  json += "\"wifi\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
-  json += "\"ip\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "") + "\",";
-  json += "\"bot\":" + String(botListo ? "true" : "false") + ",";
-  json += "\"uptime\":" + String(obtenerUptimeTotal() / 1000UL);
-  json += "}";
+  char json[512];
+  snprintf(json, sizeof(json),
+    "{"
+    "\"temp\":%.1f,"
+    "\"hum\":%.1f,"
+    "\"temp_obj\":%.1f,"
+    "\"hum_min\":%.1f,"
+    "\"hum_max\":%.1f,"
+    "\"cal\":%s,"
+    "\"humidor\":%s,"
+    "\"motor\":%s,"
+    "\"dia\":%d,"
+    "\"fase\":\"%s\","
+    "\"lockdown\":%s,"
+    "\"volteo_restante\":%lu,"
+    "\"wifi\":%s,"
+    "\"ip\":\"%s\","
+    "\"bot\":%s,"
+    "\"uptime\":%lu"
+    "}",
+    temperatura, humedad, tempObjetivo,
+    obtenerHumMin(), obtenerHumMax(),
+    estadoCalefactor ? "true" : "false",
+    estadoHumificador ? "true" : "false",
+    motorVolteando ? "true" : "false",
+    diaActual,
+    enLockdown ? "LOCKDOWN" : "DESARROLLO",
+    enLockdown ? "true" : "false",
+    calcularTiempoVolteo(),
+    WiFi.status() == WL_CONNECTED ? "true" : "false",
+    WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "",
+    botListo ? "true" : "false",
+    obtenerUptimeTotal() / 1000UL);
   server.send(200, "application/json", json);
 }
 
@@ -725,11 +790,13 @@ void notificarTodos(const String& msg) {
   if (!botListo) return;
   String resto = chatsPermitidos;
   while (resto.length() > 0) {
+    esp_task_wdt_reset();
     int coma = resto.indexOf(',');
     String id = (coma >= 0) ? resto.substring(0, coma) : resto;
     id.trim();
     if (id.length() > 0) {
       bot.sendMessage(id, msg, "");
+      yield();
     }
     if (coma >= 0) resto = resto.substring(coma + 1);
     else break;
@@ -738,6 +805,8 @@ void notificarTodos(const String& msg) {
 
 void manejarMensajes(int num) {
   for (int i = 0; i < num; i++) {
+    esp_task_wdt_reset();
+    yield();
     String chat = bot.messages[i].chat_id;
     if (chat.length() == 0) continue;
 
@@ -843,21 +912,26 @@ void procesarTelegram() {
   if (!botListo) return;
 
   if (!comandosRegistrados) {
+    esp_task_wdt_reset();
     String cmds = "[{\"command\":\"start\",\"description\":\"Bienvenida\"},{\"command\":\"help\",\"description\":\"Ayuda\"},{\"command\":\"info\",\"description\":\"Estado completo\"},{\"command\":\"temp\",\"description\":\"Fijar temp ej: temp 38\"},{\"command\":\"hum\",\"description\":\"Toggle humificador\"},{\"command\":\"cal\",\"description\":\"Toggle calefactor\"},{\"command\":\"volteo\",\"description\":\"Volteo forzado\"},{\"command\":\"guardar\",\"description\":\"Guardar estado\"},{\"command\":\"ota\",\"description\":\"Actualizar firmware (URL del bin)\"},{\"command\":\"reset\",\"description\":\"Reset estado\"}]";
     if (bot.setMyCommands(cmds)) {
       Serial.println(F("Comandos del bot registrados."));
     }
     comandosRegistrados = true;
+    yield();
   }
 
-  for (int i = 0; i < 5; i++) {
-    int num = bot.getUpdates(bot.last_message_received + 1);
-    if (num <= 0) break;
+  // Solo un lote de updates por ciclo para no bloquear el loop
+  esp_task_wdt_reset();
+  int num = bot.getUpdates(bot.last_message_received + 1);
+  if (num > 0) {
     manejarMensajes(num);
+    yield();
   }
 }
 
 void verificarAlertas() {
+  esp_task_wdt_reset();
   if (!botListo) return;
   if (temperatura <= 0.0) return;
 
@@ -879,6 +953,7 @@ void otaResponder(const String& chat, const String& msg) {
 }
 
 void hacerOTA(const String& url, const String& chat) {
+  esp_task_wdt_reset();
   if (WiFi.status() != WL_CONNECTED) {
     otaResponder(chat, "Error: sin WiFi.");
     return;
@@ -890,11 +965,11 @@ void hacerOTA(const String& url, const String& chat) {
 
   WiFiClientSecure otaClient;
   otaClient.setInsecure();
-  otaClient.setTimeout(15);
+  otaClient.setTimeout(10);
 
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(30000);
+  http.setTimeout(10000);
   http.begin(otaClient, url);
 
   int code = http.GET();
@@ -919,6 +994,7 @@ void hacerOTA(const String& url, const String& chat) {
   Stream &stream = http.getStream();
   uint8_t buf[1024];
   size_t total = 0;
+  unsigned long ultimoWdt = millis();
   while (total < (size_t)len) {
     size_t n = stream.readBytes(buf, sizeof(buf));
     if (n == 0) {
@@ -934,6 +1010,10 @@ void hacerOTA(const String& url, const String& chat) {
       return;
     }
     total += n;
+    if (millis() - ultimoWdt >= 1000) {
+      esp_task_wdt_reset();
+      ultimoWdt = millis();
+    }
     yield();
   }
 
@@ -952,6 +1032,7 @@ void hacerOTA(const String& url, const String& chat) {
 // ===================== PANTALLA TFT =====================
 
 void dibujarPantalla() {
+  esp_task_wdt_reset();
   gfx->fillScreen(COLOR_BLACK);
 
   // ---- TITULO ----
@@ -1260,6 +1341,18 @@ void setup() {
 
   Serial.println(F("\n=== Incubadora Automatica v2.0 ==="));
 
+  // Watchdog: 10 segundos; si el loop se bloquea, reinicia
+  esp_task_wdt_config_t twdt_config;
+  twdt_config.timeout_ms = 10000;
+  twdt_config.idle_core_mask = (1 << portNUM_PROCESSORS) - 1;
+  twdt_config.trigger_panic = true;
+  if (esp_task_wdt_init(&twdt_config) == ESP_OK) {
+    esp_task_wdt_add(NULL);
+    Serial.println(F("Watchdog activado (10s)."));
+  } else {
+    Serial.println(F("Watchdog NO pudo activarse."));
+  }
+
   // Pines relay
   pinMode(PIN_RELAY_HEAT, OUTPUT);
   pinMode(PIN_RELAY_HUM, OUTPUT);
@@ -1316,8 +1409,8 @@ void setup() {
   // Bot de Telegram
   bot.updateToken(telegramToken);
   secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
-  secured_client.setTimeout(5);
-  bot.waitForResponse = 500;
+  secured_client.setTimeout(3);          // timeout de socket reducido
+  bot.waitForResponse = 1500;            // ms de espera de respuesta Telegram
 
   // WiFi
   WiFi.mode(WIFI_STA);
@@ -1362,6 +1455,7 @@ void setup() {
 // ===================== LOOP =====================
 
 void loop() {
+  esp_task_wdt_reset();
   unsigned long ahora = millis();
 
   // Actualizar uptime acumulado
