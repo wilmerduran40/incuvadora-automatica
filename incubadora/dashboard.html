@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dashboard Incubadora</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --card: #181b21;
+      --text: #e0e0e0;
+      --muted: #888;
+      --green: #00c853;
+      --red: #ff1744;
+      --yellow: #ffd600;
+      --cyan: #00e5ff;
+      --magenta: #e040fb;
+      --blue: #2979ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 16px;
+      line-height: 1.4;
+    }
+    h1 {
+      text-align: center;
+      margin: 0 0 20px;
+      font-size: 1.6rem;
+      color: var(--yellow);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .card {
+      background: var(--card);
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    }
+    .card h3 {
+      margin: 0 0 10px;
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      color: var(--muted);
+      letter-spacing: 0.5px;
+    }
+    .value {
+      font-size: 2.4rem;
+      font-weight: 700;
+      margin: 4px 0;
+    }
+    .target {
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .status {
+      margin-top: 8px;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+    .ok { color: var(--green); }
+    .bad { color: var(--red); }
+    .warn { color: var(--yellow); }
+    .cyan { color: var(--cyan); }
+    .magenta { color: var(--magenta); }
+    .full { grid-column: 1 / -1; }
+    .progress-bar {
+      width: 100%;
+      height: 18px;
+      background: #2a2f36;
+      border-radius: 9px;
+      overflow: hidden;
+      margin-top: 10px;
+    }
+    .progress-fill {
+      height: 100%;
+      background: var(--green);
+      transition: width 0.5s ease;
+    }
+    .progress-fill.lockdown { background: var(--magenta); }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    button {
+      background: #2a2f36;
+      color: var(--text);
+      border: 1px solid #3a4049;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover { background: #3a4049; }
+    button:active { transform: scale(0.98); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+    }
+    td {
+      padding: 6px 0;
+      border-bottom: 1px solid #2a2f36;
+    }
+    td:first-child { width: 35%; }
+    code {
+      background: #2a2f36;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: 'SF Mono', monospace;
+      color: var(--cyan);
+    }
+    .system-info {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      font-size: 0.9rem;
+    }
+    .loading {
+      text-align: center;
+      color: var(--muted);
+      padding: 20px;
+    }
+    @media (max-width: 400px) {
+      .grid { grid-template-columns: 1fr; }
+      .system-info { grid-template-columns: 1fr; }
+      .value { font-size: 2rem; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Dashboard Incubadora</h1>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Temperatura</h3>
+      <div class="value" id="temp">--</div>
+      <div class="target" id="temp-target">Objetivo: --</div>
+      <div class="status" id="cal-status">CAL: --</div>
+    </div>
+    <div class="card">
+      <h3>Humedad</h3>
+      <div class="value" id="hum">--</div>
+      <div class="target" id="hum-target">Objetivo: --</div>
+      <div class="status" id="hum-status">HUM: --</div>
+    </div>
+  </div>
+
+  <div class="card full">
+    <h3>Progreso de Incubación</h3>
+    <div>
+      Día <strong id="dia">--</strong>/<strong>21</strong> -
+      <span id="fase" class="ok">--</span>
+    </div>
+    <div class="progress-bar">
+      <div class="progress-fill" id="progress" style="width:0%"></div>
+    </div>
+    <div class="target" style="margin-top:6px">Uptime: <span id="uptime">--</span></div>
+  </div>
+
+  <div class="card full">
+    <h3>Volteo</h3>
+    <div id="volteo" class="cyan">--</div>
+  </div>
+
+  <div class="card full">
+    <h3>Control Manual</h3>
+    <div class="controls">
+      <button onclick="sendCmd('temp_up')">+ Temp</button>
+      <button onclick="sendCmd('temp_down')">- Temp</button>
+      <button onclick="sendCmd('cal')">Calefactor</button>
+      <button onclick="sendCmd('hum')">Humificador</button>
+      <button onclick="sendCmd('vol')">Forzar Volteo</button>
+      <button onclick="sendCmd('save')">Guardar Estado</button>
+    </div>
+  </div>
+
+  <div class="card full">
+    <h3>Comandos del Bot Telegram</h3>
+    <table>
+      <tr><td><code>info</code></td><td>Estado completo del sistema</td></tr>
+      <tr><td><code>+</code> / <code>-</code></td><td>Subir / bajar temperatura objetivo</td></tr>
+      <tr><td><code>temp 38.0</code></td><td>Fijar temperatura objetivo</td></tr>
+      <tr><td><code>h</code></td><td>Alternar humidificador manual</td></tr>
+      <tr><td><code>c</code></td><td>Alternar calefactor manual</td></tr>
+      <tr><td><code>t</code></td><td>Volteo forzado</td></tr>
+      <tr><td><code>s</code></td><td>Guardar estado en flash</td></tr>
+      <tr><td><code>reset si</code></td><td>Borrar estado y reiniciar</td></tr>
+      <tr><td><code>wifi</code></td><td>Estado de la red WiFi</td></tr>
+      <tr><td><code>ota &lt;url&gt;</code></td><td>Actualizar firmware por OTA</td></tr>
+      <tr><td><code>id</code></td><td>Mostrar tu chat_id</td></tr>
+    </table>
+  </div>
+
+  <div class="card full">
+    <h3>Sistema</h3>
+    <div class="system-info">
+      <div>WiFi: <span id="wifi">--</span></div>
+      <div>IP: <span id="ip">--</span></div>
+      <div>Bot Telegram: <span id="bot">--</span></div>
+      <div>Última actualización: <span id="last-update">--</span></div>
+    </div>
+  </div>
+
+  <script>
+    const fmtTime = s => {
+      if (s < 60) return s + 's';
+      if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+      const h = Math.floor(s/3600);
+      const m = Math.floor((s%3600)/60);
+      return h + 'h ' + m + 'm';
+    };
+
+    async function update() {
+      try {
+        const res = await fetch('/api/status');
+        const d = await res.json();
+
+        document.getElementById('temp').textContent = d.temp.toFixed(1) + '°C';
+        document.getElementById('temp').className = 'value ' + ((d.temp >= 37.5 && d.temp <= 37.8) ? 'ok' : 'bad');
+        document.getElementById('temp-target').textContent = 'Objetivo: ' + d.temp_obj.toFixed(1) + '°C';
+        const cal = document.getElementById('cal-status');
+        cal.textContent = 'CAL: ' + (d.cal ? 'ON' : 'OFF');
+        cal.className = 'status ' + (d.cal ? 'ok' : 'bad');
+
+        document.getElementById('hum').textContent = d.hum.toFixed(1) + '%';
+        document.getElementById('hum').className = 'value ' + ((d.hum >= d.hum_min && d.hum <= d.hum_max) ? 'ok' : 'warn');
+        document.getElementById('hum-target').textContent = 'Objetivo: ' + d.hum_min.toFixed(0) + '-' + d.hum_max.toFixed(0) + '%';
+        const hum = document.getElementById('hum-status');
+        hum.textContent = 'HUM: ' + (d.humidor ? 'ON' : 'OFF');
+        hum.className = 'status ' + (d.humidor ? 'ok' : 'bad');
+
+        document.getElementById('dia').textContent = d.dia;
+        document.getElementById('fase').textContent = d.fase;
+        document.getElementById('fase').className = d.lockdown ? 'magenta' : 'ok';
+        document.getElementById('progress').style.width = ((d.dia / 21) * 100) + '%';
+        document.getElementById('progress').className = 'progress-fill' + (d.lockdown ? ' lockdown' : '');
+
+        const vol = document.getElementById('volteo');
+        if (d.lockdown) {
+          vol.textContent = 'LOCKDOWN - Volteo detenido';
+          vol.className = 'magenta';
+        } else if (d.motor) {
+          vol.textContent = 'GIRANDO';
+          vol.className = 'warn';
+        } else {
+          vol.textContent = 'Próximo volteo: ' + fmtTime(d.volteo_restante);
+          vol.className = 'cyan';
+        }
+
+        const wifi = document.getElementById('wifi');
+        wifi.textContent = d.wifi ? 'Conectado' : 'Desconectado';
+        wifi.className = d.wifi ? 'ok' : 'bad';
+        document.getElementById('ip').textContent = d.ip || '---';
+        const bot = document.getElementById('bot');
+        bot.textContent = d.bot ? 'Activo' : 'Inactivo';
+        bot.className = d.bot ? 'ok' : 'bad';
+        document.getElementById('uptime').textContent = Math.floor(d.uptime / 3600) + 'h';
+
+        const now = new Date();
+        document.getElementById('last-update').textContent = now.toLocaleTimeString();
+      } catch (e) {
+        console.error('Error actualizando:', e);
+        document.getElementById('last-update').textContent = 'Error de conexión';
+      }
+    }
+
+    async function sendCmd(action, value) {
+      try {
+        await fetch('/api/control?action=' + encodeURIComponent(action) + (value ? '&value=' + encodeURIComponent(value) : ''));
+        setTimeout(update, 300);
+      } catch (e) {
+        alert('Error enviando comando');
+      }
+    }
+
+    update();
+    setInterval(update, 3000);
+  </script>
+</body>
+</html>
