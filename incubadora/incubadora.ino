@@ -31,6 +31,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <UniversalTelegramBot.h>
 #include <ArduinoOTA.h>
 #include <HTTPClient.h>
@@ -43,6 +44,7 @@ constexpr unsigned int PIN_DHT22       = 4;
 constexpr unsigned int PIN_RELAY_HEAT  = 25;
 constexpr unsigned int PIN_RELAY_HUM   = 26;
 constexpr unsigned int PIN_RELAY_MOTOR = 27;
+constexpr unsigned int PIN_RELAY_FAN   = 33;
 
 // ===================== OBJETOS =====================
 AM2302::AM2302_Sensor am2302(PIN_DHT22);
@@ -77,28 +79,47 @@ bool alarmaTemp = false;
 #define COLOR_MAGENTA 0xF81F
 
 // ===================== CONSTANTES =====================
-const unsigned long INTERVALO_VOLTEO    = 2UL * 60UL * 60UL * 1000UL;
-const unsigned long DURACION_VOLTEO     = 20000UL;
 const unsigned long INTERVALO_LECTURA   = 2000UL;
 const unsigned long INTERVALO_PANTALLA  = 1000UL;
 const unsigned long INTERVALO_GUARDADO  = 60000UL;
 const unsigned long INTERVALO_BOT       = 5000UL;
 const unsigned long INTERVALO_RECONEXION_WIFI = 30000UL;
-const int DIAS_INCUBACION              = 21;
-const int DIA_LOCKDOWN                  = 18;
+const unsigned long TIMEOUT_AP_WIFI     = 60000UL; // 60s para intentar WiFi antes de activar AP
+const unsigned long INTERVALO_HISTORICO = 300000UL; // 5 minutos
+const size_t MAX_HISTORICO              = 288;      // 24h a 5 min
 
-// Humedad fase desarrollo (dias 1-17)
-const float HUM_MIN_DESARROLLO = 50.0;
-const float HUM_MAX_DESARROLLO = 55.0;
+// ===================== PERFILES DE INCUBACION =====================
+struct Perfil {
+  const char* nombre;
+  int dias_total;
+  int dia_lockdown;
+  float temp_objetivo;
+  float temp_min;
+  float temp_max;
+  float hum_min_desarrollo;
+  float hum_max_desarrollo;
+  float hum_min_lockdown;
+  float hum_max_lockdown;
+  unsigned long intervalo_volteo_ms;
+  unsigned long duracion_volteo_ms;
+};
 
-// Humedad fase lockdown (dias 18-21)
-const float HUM_MIN_LOCKDOWN = 65.0;
-const float HUM_MAX_LOCKDOWN = 70.0;
+const Perfil PERFILES[] = {
+  {"Pollo",        21, 18, 37.6, 37.5, 37.8, 50.0, 55.0, 65.0, 70.0, 2UL*60UL*60UL*1000UL, 20000UL},
+  {"Codorniz",     18, 14, 37.5, 37.4, 37.8, 45.0, 50.0, 60.0, 65.0, 2UL*60UL*60UL*1000UL, 20000UL},
+  {"Pavo",         28, 25, 37.5, 37.4, 37.8, 50.0, 55.0, 65.0, 70.0, 2UL*60UL*60UL*1000UL, 25000UL},
+  {"Pato",         28, 25, 37.5, 37.4, 37.8, 55.0, 60.0, 70.0, 75.0, 2UL*60UL*60UL*1000UL, 25000UL},
+  {"Personalizado",21, 18, 37.6, 37.5, 37.8, 50.0, 55.0, 65.0, 70.0, 2UL*60UL*60UL*1000UL, 20000UL}
+};
+const int NUM_PERFILES = sizeof(PERFILES) / sizeof(PERFILES[0]);
 
-// Temperatura constante todo el ciclo
+Perfil perfilActivo = PERFILES[0];
+int perfilIdActivo = 0;
+
+// Parámetros editables (copia del perfil activo, usado también para personalizado)
 float tempObjetivo = 37.5;
-const float TEMP_MIN      = 37.5;
-const float TEMP_MAX      = 37.8;
+float tempMin      = 37.5;
+float tempMax      = 37.8;
 
 // ===================== VARIABLES DE ESTADO =====================
 float temperatura = 0.0;
@@ -108,6 +129,8 @@ bool estadoCalefactor = false;
 bool estadoHumificador = false;
 bool motorVolteando = false;
 bool enLockdown = false;
+bool estadoVentilador = true;
+bool ventiladorManual = false;
 
 unsigned long ultimoVolteo = 0;
 unsigned long inicioVolteo = 0;
@@ -118,11 +141,30 @@ unsigned long ultimoBot = 0;
 unsigned long inicioIncubacion = 0;
 unsigned long uptimeAcumulado = 0;
 unsigned long millisEnUltimoGuardado = 0;
+unsigned long ultimoMuestreoHistorico = 0;
 
 int diaActual = 0;
 
 bool manualCal = false;
 bool manualHum = false;
+
+// ===================== HISTORICO PARA GRAFICOS =====================
+struct MuestraHistorico {
+  unsigned long uptime;
+  float temp;
+  float hum;
+};
+MuestraHistorico historico[MAX_HISTORICO];
+size_t historicoCount = 0;
+size_t historicoIndex = 0;
+
+// ===================== MODO AP / CONFIGURACION =====================
+bool modoAP = false;
+bool intentoWiFiInicial = false;
+unsigned long inicioIntentoWiFi = 0;
+DNSServer dnsServer;
+const char* AP_SSID = "Incubadora-Setup";
+const char* AP_PASS = "incubadora123";
 
 // ===================== WEB SERVER DASHBOARD =====================
 WebServer server(80);
@@ -134,55 +176,13 @@ volatile bool webCmdTempUp = false;
 volatile bool webCmdTempDown = false;
 volatile bool webCmdSave = false;
 volatile float webCmdTempSet = 0.0;
+volatile bool webCmdFan = false;
+volatile int webCmdProfileId = -1;
+volatile bool webCmdCustom = false;
+volatile float webCmdCustomParams[10] = {0};
 
 const char DASHBOARD_HTML[] PROGMEM =
-  "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"><title>Dashboard Incubadora</title><style>"
-  ":root{--bg:#0f1115;--card:#181b21;--text:#e0e0e0;--muted:#888;--green:#00c853;--red:#ff1744;--yellow:#ffd600;--cyan:#00e5ff;--magenta:#e040fb}"
-  "*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);padding:16px;line-height:1.4}"
-  "h1{text-align:center;margin:0 0 20px;font-size:1.6rem;color:var(--yellow)}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}"
-  ".card{background:var(--card);border-radius:12px;padding:14px;box-shadow:0 2px 8px rgba(0,0,0,.3)}.card h3{margin:0 0 10px;font-size:.85rem;text-transform:uppercase;color:var(--muted);letter-spacing:.5px}"
-  ".value{font-size:2.4rem;font-weight:700;margin:4px 0}.target{font-size:.8rem;color:var(--muted)}.status{margin-top:8px;font-size:.9rem;font-weight:600}"
-  ".ok{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--yellow)}.cyan{color:var(--cyan)}.magenta{color:var(--magenta)}.full{grid-column:1/-1}"
-  ".progress-bar{width:100%;height:18px;background:#2a2f36;border-radius:9px;overflow:hidden;margin-top:10px}.progress-fill{height:100%;background:var(--green);transition:width .5s ease}"
-  ".progress-fill.lockdown{background:var(--magenta)}.controls{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}"
-  "button{background:#2a2f36;color:var(--text);border:1px solid #3a4049;border-radius:8px;padding:10px 14px;font-size:.9rem;cursor:pointer;transition:background .2s}"
-  "button:hover{background:#3a4049}button:active{transform:scale(.98)}table{width:100%;border-collapse:collapse;font-size:.85rem}"
-  "td{padding:6px 0;border-bottom:1px solid #2a2f36}td:first-child{width:35%}code{background:#2a2f36;padding:2px 6px;border-radius:4px;font-family:'SF Mono',monospace;color:var(--cyan)}"
-  ".system-info{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:.9rem}@media(max-width:400px){.grid{grid-template-columns:1fr}.system-info{grid-template-columns:1fr}.value{font-size:2rem}}"
-  "</style></head><body><h1>Dashboard Incubadora</h1><div class=\"grid\"><div class=\"card\"><h3>Temperatura</h3><div class=\"value\" id=\"temp\">--</div>"
-  "<div class=\"target\" id=\"temp-target\">Objetivo: --</div><div class=\"status\" id=\"cal-status\">CAL: --</div></div><div class=\"card\"><h3>Humedad</h3>"
-  "<div class=\"value\" id=\"hum\">--</div><div class=\"target\" id=\"hum-target\">Objetivo: --</div><div class=\"status\" id=\"hum-status\">HUM: --</div></div></div>"
-  "<div class=\"card full\"><h3>Progreso de Incubación</h3><div>Día <strong id=\"dia\">--</strong>/<strong>21</strong> - <span id=\"fase\" class=\"ok\">--</span></div>"
-  "<div class=\"progress-bar\"><div class=\"progress-fill\" id=\"progress\" style=\"width:0%\"></div></div><div class=\"target\" style=\"margin-top:6px\">Uptime: <span id=\"uptime\">--</span></div></div>"
-  "<div class=\"card full\"><h3>Volteo</h3><div id=\"volteo\" class=\"cyan\">--</div></div>"
-  "<div class=\"card full\"><h3>Control Manual</h3><div class=\"controls\"><button onclick=\"sendCmd('temp_up')\">+ Temp</button>"
-  "<button onclick=\"sendCmd('temp_down')\">- Temp</button><button onclick=\"sendCmd('cal')\">Calefactor</button><button onclick=\"sendCmd('hum')\">Humificador</button>"
-  "<button onclick=\"sendCmd('vol')\">Forzar Volteo</button><button onclick=\"sendCmd('save')\">Guardar Estado</button></div></div>"
-  "<div class=\"card full\"><h3>Comandos del Bot Telegram</h3><table><tr><td><code>info</code></td><td>Estado completo del sistema</td></tr>"
-  "<tr><td><code>+</code> / <code>-</code></td><td>Subir / bajar temperatura objetivo</td></tr><tr><td><code>temp 38.0</code></td><td>Fijar temperatura objetivo</td></tr>"
-  "<tr><td><code>h</code></td><td>Alternar humidificador manual</td></tr><tr><td><code>c</code></td><td>Alternar calefactor manual</td></tr>"
-  "<tr><td><code>t</code></td><td>Volteo forzado</td></tr><tr><td><code>s</code></td><td>Guardar estado en flash</td></tr>"
-  "<tr><td><code>reset si</code></td><td>Borrar estado y reiniciar</td></tr><tr><td><code>wifi</code></td><td>Estado de la red WiFi</td></tr>"
-  "<tr><td><code>ota &lt;url&gt;</code></td><td>Actualizar firmware por OTA</td></tr><tr><td><code>id</code></td><td>Mostrar tu chat_id</td></tr></table></div>"
-  "<div class=\"card full\"><h3>Sistema</h3><div class=\"system-info\"><div>WiFi: <span id=\"wifi\">--</span></div><div>IP: <span id=\"ip\">--</span></div>"
-  "<div>Bot Telegram: <span id=\"bot\">--</span></div><div>Última actualización: <span id=\"last-update\">--</span></div></div></div>"
-  "<script>const fmtTime=s=>{if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m '+(s%60)+'s';const h=Math.floor(s/3600);const m=Math.floor((s%3600)/60);return h+'h '+m+'m'};"
-  "async function update(){try{const res=await fetch('/api/status');const d=await res.json();document.getElementById('temp').textContent=d.temp.toFixed(1)+'°C';"
-  "document.getElementById('temp').className='value '+((d.temp>=37.5&&d.temp<=37.8)?'ok':'bad');document.getElementById('temp-target').textContent='Objetivo: '+d.temp_obj.toFixed(1)+'°C';"
-  "const cal=document.getElementById('cal-status');cal.textContent='CAL: '+(d.cal?'ON':'OFF');cal.className='status '+(d.cal?'ok':'bad');"
-  "document.getElementById('hum').textContent=d.hum.toFixed(1)+'%';document.getElementById('hum').className='value '+((d.hum>=d.hum_min&&d.hum<=d.hum_max)?'ok':'warn');"
-  "document.getElementById('hum-target').textContent='Objetivo: '+d.hum_min.toFixed(0)+'-'+d.hum_max.toFixed(0)+'%';const hum=document.getElementById('hum-status');"
-  "hum.textContent='HUM: '+(d.humidor?'ON':'OFF');hum.className='status '+(d.humidor?'ok':'bad');document.getElementById('dia').textContent=d.dia;"
-  "document.getElementById('fase').textContent=d.fase;document.getElementById('fase').className=d.lockdown?'magenta':'ok';"
-  "document.getElementById('progress').style.width=((d.dia/21)*100)+'%';document.getElementById('progress').className='progress-fill'+(d.lockdown?' lockdown':'');"
-  "const vol=document.getElementById('volteo');if(d.lockdown){vol.textContent='LOCKDOWN - Volteo detenido';vol.className='magenta'}else if(d.motor){vol.textContent='GIRANDO';vol.className='warn'}"
-  "else{vol.textContent='Próximo volteo: '+fmtTime(d.volteo_restante);vol.className='cyan'}const wifi=document.getElementById('wifi');"
-  "wifi.textContent=d.wifi?'Conectado':'Desconectado';wifi.className=d.wifi?'ok':'bad';document.getElementById('ip').textContent=d.ip||'---';"
-  "const bot=document.getElementById('bot');bot.textContent=d.bot?'Activo':'Inactivo';bot.className=d.bot?'ok':'bad';"
-  "document.getElementById('uptime').textContent=Math.floor(d.uptime/3600)+'h';document.getElementById('last-update').textContent=new Date().toLocaleTimeString()}"
-  "catch(e){console.error('Error actualizando:',e);document.getElementById('last-update').textContent='Error de conexión'}}"
-  "async function sendCmd(action,value){try{await fetch('/api/control?action='+encodeURIComponent(action)+(value?'&value='+encodeURIComponent(value):''));setTimeout(update,300)}catch(e){alert('Error enviando comando')}}"
-  "update();setInterval(update,3000);</script></body></html>";
+  "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>Dashboard Incubadora</title><style> :root { --bg: #0f1115; --card: #181b21; --text: #e0e0e0; --muted: #888; --green: #00c853; --red: #ff1744; --yellow: #ffd600; --cyan: #00e5ff; --magenta: #e040fb; --blue: #2979ff; --orange: #ff9100; } * { box-sizing: border-box; } body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 16px; line-height: 1.4; } h1 { text-align: center; margin: 0 0 16px; font-size: 1.5rem; color: var(--yellow); } .tabs { display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 1px solid #2a2f36; padding-bottom: 8px; } .tab-btn { flex: 1; background: transparent; border: none; color: var(--muted); padding: 10px; font-size: 0.95rem; cursor: pointer; border-radius: 8px; transition: all 0.2s; } .tab-btn.active { background: var(--card); color: var(--text); } .tab-content { display: none; } .tab-content.active { display: block; } .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; } .card { background: var(--card); border-radius: 12px; padding: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.3); margin-bottom: 12px; } .card h3 { margin: 0 0 10px; font-size: 0.8rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.5px; } .value { font-size: 2.2rem; font-weight: 700; margin: 4px 0; } .target { font-size: 0.8rem; color: var(--muted); } .status { margin-top: 8px; font-size: 0.9rem; font-weight: 600; } .ok { color: var(--green); } .bad { color: var(--red); } .warn { color: var(--yellow); } .cyan { color: var(--cyan); } .magenta { color: var(--magenta); } .blue { color: var(--blue); } .orange { color: var(--orange); } .full { grid-column: 1 / -1; } .progress-bar { width: 100%; height: 18px; background: #2a2f36; border-radius: 9px; overflow: hidden; margin-top: 10px; } .progress-fill { height: 100%; background: var(--green); transition: width 0.5s ease; } .progress-fill.lockdown { background: var(--magenta); } .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; } button, input[type=submit] { background: #2a2f36; color: var(--text); border: 1px solid #3a4049; border-radius: 8px; padding: 10px 14px; font-size: 0.9rem; cursor: pointer; transition: background 0.2s; } button:hover, input[type=submit]:hover { background: #3a4049; } button:active { transform: scale(0.98); } button.on { background: var(--green); color: #000; border-color: var(--green); } button.off { background: var(--red); color: #fff; border-color: var(--red); } .form-group { margin-bottom: 12px; } label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 4px; } input, select { width: 100%; background: #2a2f36; color: var(--text); border: 1px solid #3a4049; border-radius: 8px; padding: 10px; font-size: 0.95rem; } .system-info { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 0.9rem; } .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--card); color: var(--text); padding: 10px 18px; border-radius: 8px; border: 1px solid #3a4049; display: none; z-index: 100; } .chart-container { width: 100%; height: 260px; background: #0f1115; border-radius: 12px; padding: 10px; } svg { width: 100%; height: 100%; } .legend { display: flex; gap: 16px; font-size: 0.85rem; margin-bottom: 10px; } .legend span::before { content: \'\'; display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 4px; } .legend .temp::before { background: var(--red); } .legend .hum::before { background: var(--cyan); } @media (max-width: 400px) { .grid { grid-template-columns: 1fr; } .system-info { grid-template-columns: 1fr; } .value { font-size: 2rem; } } </style></head><body><h1>Dashboard Incubadora</h1><div class=\"tabs\"><button class=\"tab-btn active\" onclick=\"showTab(\'estado\')\">Estado</button><button class=\"tab-btn\" onclick=\"showTab(\'graficos\')\">Gráficos</button><button class=\"tab-btn\" onclick=\"showTab(\'config\')\">Configuración</button></div><div id=\"estado\" class=\"tab-content active\"><div class=\"card full\"><h3>Perfil de Incubación</h3><div class=\"controls\"><select id=\"perfil-select\" onchange=\"cambiarPerfil(this.value)\"><option value=\"0\">Pollo</option><option value=\"1\">Codorniz</option><option value=\"2\">Pavo</option><option value=\"3\">Pato</option><option value=\"4\">Personalizado</option></select></div><div class=\"target\" style=\"margin-top:8px\">Especies: <span id=\"perfil-nombre\">--</span></div></div><div class=\"grid\"><div class=\"card\"><h3>Temperatura</h3><div class=\"value\" id=\"temp\">--</div><div class=\"target\" id=\"temp-target\">Objetivo: --</div><div class=\"status\" id=\"cal-status\">CAL: --</div></div><div class=\"card\"><h3>Humedad</h3><div class=\"value\" id=\"hum\">--</div><div class=\"target\" id=\"hum-target\">Objetivo: --</div><div class=\"status\" id=\"hum-status\">HUM: --</div></div><div class=\"card\"><h3>Ventilador</h3><div class=\"value cyan\" id=\"fan\">--</div><div class=\"target\">Recirculación de aire</div><div class=\"controls\"><button id=\"fan-btn\" onclick=\"sendCmd(\'fan\')\">--</button></div></div><div class=\"card\"><h3>Sistema</h3><div class=\"system-info\"><div>WiFi: <span id=\"wifi\">--</span></div><div>IP: <span id=\"ip\">--</span></div><div>Bot: <span id=\"bot\">--</span></div><div>Modo: <span id=\"modo\">--</span></div></div></div></div><div class=\"card full\"><h3>Progreso de Incubación</h3><div> Día <strong id=\"dia\">--</strong>/<strong id=\"dias-total\">--</strong> - <span id=\"fase\" class=\"ok\">--</span></div><div class=\"progress-bar\"><div class=\"progress-fill\" id=\"progress\" style=\"width:0%\"></div></div><div class=\"target\" style=\"margin-top:6px\">Uptime: <span id=\"uptime\">--</span></div></div><div class=\"card full\"><h3>Volteo</h3><div id=\"volteo\" class=\"cyan\">--</div></div><div class=\"card full\"><h3>Control Manual</h3><div class=\"controls\"><button onclick=\"sendCmd(\'temp_up\')\">+ Temp</button><button onclick=\"sendCmd(\'temp_down\')\">- Temp</button><button onclick=\"sendCmd(\'cal\')\">Calefactor</button><button onclick=\"sendCmd(\'hum\')\">Humificador</button><button onclick=\"sendCmd(\'vol\')\">Forzar Volteo</button><button onclick=\"sendCmd(\'save\')\">Guardar Estado</button></div></div><div class=\"card full\"><h3>Última actualización</h3><div class=\"target\" id=\"last-update\">--</div></div></div><div id=\"graficos\" class=\"tab-content\"><div class=\"card full\"><h3>Histórico (últimas 24h)</h3><div class=\"legend\"><span class=\"temp\">Temperatura (°C)</span><span class=\"hum\">Humedad (%)</span></div><div class=\"chart-container\"><svg id=\"chart\" viewBox=\"0 0 600 240\" preserveAspectRatio=\"none\"><g id=\"chart-grid\"></g><path id=\"chart-temp\" fill=\"none\" stroke=\"#ff1744\" stroke-width=\"2\"></path><path id=\"chart-hum\" fill=\"none\" stroke=\"#00e5ff\" stroke-width=\"2\"></path></svg></div></div></div><div id=\"config\" class=\"tab-content\"><div class=\"card full\"><h3>Configuración WiFi</h3><form onsubmit=\"guardarConfig(event)\"><div class=\"form-group\"><label>SSID</label><input type=\"text\" id=\"cfg-ssid\" placeholder=\"Nombre de red\" required></div><div class=\"form-group\"><label>Contraseña</label><input type=\"password\" id=\"cfg-pass\" placeholder=\"Contraseña\"></div><div class=\"form-group\"><label>Token Bot Telegram</label><input type=\"text\" id=\"cfg-token\" placeholder=\"Opcional\"></div><div class=\"form-group\"><label>Chat IDs permitidos (separados por coma)</label><input type=\"text\" id=\"cfg-chats\" placeholder=\"Opcional\"></div><input type=\"submit\" value=\"Guardar y reiniciar\"></form></div><div class=\"card full\" id=\"custom-panel\" style=\"display:none\"><h3>Parámetros Personalizados</h3><form onsubmit=\"guardarCustom(event)\"><div class=\"grid\"><div class=\"form-group\"><label>Días totales</label><input type=\"number\" id=\"c-dias\" value=\"21\" required></div><div class=\"form-group\"><label>Día lockdown</label><input type=\"number\" id=\"c-lockdown\" value=\"18\" required></div><div class=\"form-group\"><label>Temp objetivo</label><input type=\"number\" step=\"0.1\" id=\"c-temp-obj\" value=\"37.6\" required></div><div class=\"form-group\"><label>Temp mínima</label><input type=\"number\" step=\"0.1\" id=\"c-temp-min\" value=\"37.5\" required></div><div class=\"form-group\"><label>Temp máxima</label><input type=\"number\" step=\"0.1\" id=\"c-temp-max\" value=\"37.8\" required></div><div class=\"form-group\"><label>Hum mín desarrollo</label><input type=\"number\" step=\"0.1\" id=\"c-hum-min-dev\" value=\"50\" required></div><div class=\"form-group\"><label>Hum máx desarrollo</label><input type=\"number\" step=\"0.1\" id=\"c-hum-max-dev\" value=\"55\" required></div><div class=\"form-group\"><label>Hum mín lockdown</label><input type=\"number\" step=\"0.1\" id=\"c-hum-min-lock\" value=\"65\" required></div><div class=\"form-group\"><label>Hum máx lockdown</label><input type=\"number\" step=\"0.1\" id=\"c-hum-max-lock\" value=\"70\" required></div><div class=\"form-group\"><label>Intervalo volteo (horas)</label><input type=\"number\" step=\"0.5\" id=\"c-volteo\" value=\"2\" required></div></div><input type=\"submit\" value=\"Aplicar personalizado\"></form></div></div><div class=\"toast\" id=\"toast\"></div><script> let currentData = {}; const fmtTime = s => { if (s < 60) return s + \'s\'; if (s < 3600) return Math.floor(s/60) + \'m \' + (s%60) + \'s\'; const h = Math.floor(s/3600); const m = Math.floor((s%3600)/60); return h + \'h \' + m + \'m\'; }; function showTab(id) { document.querySelectorAll(\'.tab-content\').forEach(el => el.classList.remove(\'active\')); document.querySelectorAll(\'.tab-btn\').forEach(el => el.classList.remove(\'active\')); document.getElementById(id).classList.add(\'active\'); event.target.classList.add(\'active\'); if (id === \'graficos\') cargarHistorico(); } function toast(msg) { const t = document.getElementById(\'toast\'); t.textContent = msg; t.style.display = \'block\'; setTimeout(() => t.style.display = \'none\', 2500); } async function update() { try { const res = await fetch(\'/api/status\'); const d = await res.json(); currentData = d; document.getElementById(\'temp\').textContent = d.temp.toFixed(1) + \'°C\'; document.getElementById(\'temp\').className = \'value \' + ((d.temp >= d.temp_min && d.temp <= d.temp_max) ? \'ok\' : \'bad\'); document.getElementById(\'temp-target\').textContent = \'Objetivo: \' + d.temp_obj.toFixed(1) + \'°C (\' + d.temp_min.toFixed(1) + \'-\' + d.temp_max.toFixed(1) + \')\'; const cal = document.getElementById(\'cal-status\'); cal.textContent = \'CAL: \' + (d.cal ? \'ON\' : \'OFF\'); cal.className = \'status \' + (d.cal ? \'ok\' : \'bad\'); document.getElementById(\'hum\').textContent = d.hum.toFixed(1) + \'%\'; document.getElementById(\'hum\').className = \'value \' + ((d.hum >= d.hum_min && d.hum <= d.hum_max) ? \'ok\' : \'warn\'); document.getElementById(\'hum-target\').textContent = \'Objetivo: \' + d.hum_min.toFixed(0) + \'-\' + d.hum_max.toFixed(0) + \'%\'; const hum = document.getElementById(\'hum-status\'); hum.textContent = \'HUM: \' + (d.humidor ? \'ON\' : \'OFF\'); hum.className = \'status \' + (d.humidor ? \'ok\' : \'bad\'); document.getElementById(\'fan\').textContent = d.fan ? \'ON\' : \'OFF\'; document.getElementById(\'fan\').className = \'value \' + (d.fan ? \'cyan\' : \'bad\'); const fanBtn = document.getElementById(\'fan-btn\'); fanBtn.textContent = d.fan ? \'Apagar ventilador\' : \'Encender ventilador\'; fanBtn.className = d.fan ? \'on\' : \'off\'; document.getElementById(\'perfil-select\').value = d.perfil_id; document.getElementById(\'perfil-nombre\').textContent = d.perfil; document.getElementById(\'custom-panel\').style.display = (d.perfil_id == 4) ? \'block\' : \'none\'; document.getElementById(\'dia\').textContent = d.dia; document.getElementById(\'dias-total\').textContent = d.dias_total; document.getElementById(\'fase\').textContent = d.fase; document.getElementById(\'fase\').className = d.lockdown ? \'magenta\' : \'ok\'; document.getElementById(\'progress\').style.width = ((d.dia / d.dias_total) * 100) + \'%\'; document.getElementById(\'progress\').className = \'progress-fill\' + (d.lockdown ? \' lockdown\' : \'\'); const vol = document.getElementById(\'volteo\'); if (d.lockdown) { vol.textContent = \'LOCKDOWN - Volteo detenido\'; vol.className = \'magenta\'; } else if (d.motor) { vol.textContent = \'GIRANDO\'; vol.className = \'warn\'; } else { vol.textContent = \'Próximo volteo: \' + fmtTime(d.volteo_restante); vol.className = \'cyan\'; } const wifi = document.getElementById(\'wifi\'); wifi.textContent = d.wifi ? \'Conectado\' : \'Desconectado\'; wifi.className = d.wifi ? \'ok\' : \'bad\'; document.getElementById(\'ip\').textContent = d.ip || \'---\'; const bot = document.getElementById(\'bot\'); bot.textContent = d.bot ? \'Activo\' : \'Inactivo\'; bot.className = d.bot ? \'ok\' : \'bad\'; const modo = document.getElementById(\'modo\'); modo.textContent = d.modo_ap ? \'AP\' : \'STA\'; modo.className = d.modo_ap ? \'warn\' : \'cyan\'; document.getElementById(\'uptime\').textContent = Math.floor(d.uptime / 3600) + \'h\'; document.getElementById(\'last-update\').textContent = new Date().toLocaleTimeString(); } catch (e) { console.error(\'Error actualizando:\', e); document.getElementById(\'last-update\').textContent = \'Error de conexión\'; } } async function sendCmd(action, value) { try { await fetch(\'/api/control?action=\' + encodeURIComponent(action) + (value ? \'&value=\' + encodeURIComponent(value) : \'\')); toast(\'Comando enviado\'); setTimeout(update, 300); } catch (e) { toast(\'Error enviando comando\'); } } async function cambiarPerfil(id) { await sendCmd(\'profile\', id); } async function guardarConfig(e) { e.preventDefault(); const ssid = document.getElementById(\'cfg-ssid\').value; const pass = document.getElementById(\'cfg-pass\').value; const token = document.getElementById(\'cfg-token\').value; const chats = document.getElementById(\'cfg-chats\').value; try { const res = await fetch(\'/api/config\', { method: \'POST\', headers: {\'Content-Type\': \'application/x-www-form-urlencoded\'}, body: \'ssid=\' + encodeURIComponent(ssid) + \'&pass=\' + encodeURIComponent(pass) + \'&token=\' + encodeURIComponent(token) + \'&chats=\' + encodeURIComponent(chats) }); const d = await res.json(); toast(d.msg); } catch (e) { toast(\'Error guardando configuración\'); } } async function guardarCustom(e) { e.preventDefault(); const params = { dias_total: document.getElementById(\'c-dias\').value, dia_lockdown: document.getElementById(\'c-lockdown\').value, temp_obj: document.getElementById(\'c-temp-obj\').value, temp_min: document.getElementById(\'c-temp-min\').value, temp_max: document.getElementById(\'c-temp-max\').value, hum_min_dev: document.getElementById(\'c-hum-min-dev\').value, hum_max_dev: document.getElementById(\'c-hum-max-dev\').value, hum_min_lock: document.getElementById(\'c-hum-min-lock\').value, hum_max_lock: document.getElementById(\'c-hum-max-lock\').value, intervalo_volteo_h: document.getElementById(\'c-volteo\').value }; let qs = \'action=custom\'; for (let k in params) qs += \'&\' + k + \'=\' + encodeURIComponent(params[k]); try { await fetch(\'/api/control?\' + qs); toast(\'Personalizado aplicado\'); setTimeout(update, 300); } catch (e) { toast(\'Error aplicando personalizado\'); } } async function cargarHistorico() { try { const res = await fetch(\'/api/history\'); const data = await res.json(); dibujarGrafico(data); } catch (e) { console.error(\'Error cargando histórico:\', e); } } function dibujarGrafico(data) { if (data.length < 2) return; const svg = document.getElementById(\'chart\'); const w = 600, h = 240, pad = 30; const gw = w - pad * 2, gh = h - pad * 2; let minT = 30, maxT = 45, minH = 20, maxH = 90; data.forEach(p => { if (p.temp < minT) minT = p.temp; if (p.temp > maxT) maxT = p.temp; if (p.hum < minH) minH = p.hum; if (p.hum > maxH) maxH = p.hum; }); minT = Math.floor(minT); maxT = Math.ceil(maxT); minH = Math.floor(minH / 10) * 10; maxH = Math.ceil(maxH / 10) * 10; const t0 = data[0].t, tn = data[data.length - 1].t; const dx = tn === t0 ? 0 : gw / (tn - t0); const pt = (x, y, min, max) => { const px = pad + (x - t0) * dx; const py = pad + gh - ((y - min) / (max - min)) * gh; return px.toFixed(1) + \',\' + py.toFixed(1); }; document.getElementById(\'chart-temp\').setAttribute(\'d\', \'M \' + data.map(p => pt(p.t, p.temp, minT, maxT)).join(\' L \')); document.getElementById(\'chart-hum\').setAttribute(\'d\', \'M \' + data.map(p => pt(p.t, p.hum, minH, maxH)).join(\' L \')); const grid = document.getElementById(\'chart-grid\'); grid.innerHTML = \'\'; for (let i = 0; i <= 4; i++) { const y = pad + (gh * i) / 4; grid.innerHTML += `<line x1=\"${pad}\" y1=\"${y}\" x2=\"${w-pad}\" y2=\"${y}\" stroke=\"#2a2f36\" stroke-width=\"1\"/>`; grid.innerHTML += `<text x=\"5\" y=\"${y+4}\" fill=\"#888\" font-size=\"10\">${(maxT - (maxT-minT)*i/4).toFixed(1)}</text>`; grid.innerHTML += `<text x=\"${w-pad+4}\" y=\"${y+4}\" fill=\"#888\" font-size=\"10\">${(maxH - (maxH-minH)*i/4).toFixed(0)}</text>`; } } update(); setInterval(update, 3000); </script></body></html> ";
 
 // ===================== PERSISTENCIA (PROTECCION CORTE) =====================
 
@@ -195,6 +195,21 @@ void guardarEstado() {
   preferences.putULong("ultimoVol", ultimoVolteo);
   preferences.putBool("manCal", manualCal);
   preferences.putBool("manHum", manualHum);
+
+  // Guardar perfil activo y parámetros personalizados
+  preferences.putInt("perfilId", perfilIdActivo);
+  preferences.putInt("p_dias_total", perfilActivo.dias_total);
+  preferences.putInt("p_dia_lockdown", perfilActivo.dia_lockdown);
+  preferences.putFloat("p_temp_obj", perfilActivo.temp_objetivo);
+  preferences.putFloat("p_temp_min", perfilActivo.temp_min);
+  preferences.putFloat("p_temp_max", perfilActivo.temp_max);
+  preferences.putFloat("p_hum_min_dev", perfilActivo.hum_min_desarrollo);
+  preferences.putFloat("p_hum_max_dev", perfilActivo.hum_max_desarrollo);
+  preferences.putFloat("p_hum_min_lock", perfilActivo.hum_min_lockdown);
+  preferences.putFloat("p_hum_max_lock", perfilActivo.hum_max_lockdown);
+  preferences.putULong("p_int_volteo", perfilActivo.intervalo_volteo_ms);
+  preferences.putULong("p_dur_volteo", perfilActivo.duracion_volteo_ms);
+  preferences.putBool("fan_on", estadoVentilador);
 
   preferences.end();
   esp_task_wdt_reset();
@@ -209,18 +224,39 @@ void cargarEstado() {
   manualCal = preferences.getBool("manCal", false);
   manualHum = preferences.getBool("manHum", false);
 
+  perfilIdActivo = preferences.getInt("perfilId", 0);
+  if (perfilIdActivo < 0 || perfilIdActivo >= NUM_PERFILES) perfilIdActivo = 0;
+
+  // Cargar parámetros personalizados si existen; si no, usar valores por defecto
+  Perfil base = PERFILES[perfilIdActivo];
+  perfilActivo.nombre = base.nombre;
+  perfilActivo.dias_total = preferences.getInt("p_dias_total", base.dias_total);
+  perfilActivo.dia_lockdown = preferences.getInt("p_dia_lockdown", base.dia_lockdown);
+  perfilActivo.temp_objetivo = preferences.getFloat("p_temp_obj", base.temp_objetivo);
+  perfilActivo.temp_min = preferences.getFloat("p_temp_min", base.temp_min);
+  perfilActivo.temp_max = preferences.getFloat("p_temp_max", base.temp_max);
+  perfilActivo.hum_min_desarrollo = preferences.getFloat("p_hum_min_dev", base.hum_min_desarrollo);
+  perfilActivo.hum_max_desarrollo = preferences.getFloat("p_hum_max_dev", base.hum_max_desarrollo);
+  perfilActivo.hum_min_lockdown = preferences.getFloat("p_hum_min_lock", base.hum_min_lockdown);
+  perfilActivo.hum_max_lockdown = preferences.getFloat("p_hum_max_lock", base.hum_max_lockdown);
+  perfilActivo.intervalo_volteo_ms = preferences.getULong("p_int_volteo", base.intervalo_volteo_ms);
+  perfilActivo.duracion_volteo_ms = preferences.getULong("p_dur_volteo", base.duracion_volteo_ms);
+  estadoVentilador = preferences.getBool("fan_on", true);
+
   preferences.end();
 
   uptimeAcumulado = uptimeGuardado;
   millisEnUltimoGuardado = millis();
+
+  // Aplicar parámetros editables
+  tempObjetivo = perfilActivo.temp_objetivo;
+  tempMin = perfilActivo.temp_min;
+  tempMax = perfilActivo.temp_max;
 }
 
 void borrarEstado() {
   preferences.begin("incubadora", false);
-  preferences.remove("uptime");
-  preferences.remove("ultimoVol");
-  preferences.remove("manCal");
-  preferences.remove("manHum");
+  preferences.clear();
   preferences.end();
 
   uptimeAcumulado = 0;
@@ -229,6 +265,12 @@ void borrarEstado() {
   millisEnUltimoGuardado = millis();
   manualCal = false;
   manualHum = false;
+  perfilIdActivo = 0;
+  perfilActivo = PERFILES[0];
+  tempObjetivo = perfilActivo.temp_objetivo;
+  tempMin = perfilActivo.temp_min;
+  tempMax = perfilActivo.temp_max;
+  estadoVentilador = true;
 
   Serial.println(F("Estado borrado. Reiniciando."));
 }
@@ -264,10 +306,38 @@ void configurarWifi(const String& ssid, const String& pass) {
   WiFi.disconnect();
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
   ultimoIntentoWifi = millis();
+  inicioIntentoWiFi = millis();
+  intentoWiFiInicial = true;
+}
+
+void iniciarModoAP() {
+  if (modoAP) return;
+  Serial.println(F("Iniciando modo AP..."));
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  modoAP = true;
+  Serial.print(F("AP: "));
+  Serial.println(AP_SSID);
+  Serial.print(F("IP: "));
+  Serial.println(WiFi.softAPIP());
+}
+
+void detenerModoAP() {
+  if (!modoAP) return;
+  Serial.println(F("Cerrando modo AP..."));
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  modoAP = false;
 }
 
 void gestionarWifi() {
   static bool ntpArrancado = false;
+
+  if (modoAP) {
+    dnsServer.processNextRequest();
+    return;
+  }
 
   if (WiFi.status() == WL_CONNECTED) {
     if (!ntpArrancado) {
@@ -275,17 +345,38 @@ void gestionarWifi() {
       ntpArrancado = true;
     }
     ultimoIntentoWifi = millis();
+    inicioIntentoWiFi = millis();
     return;
   }
 
-  if (wifiSsid.length() == 0) return;
+  // Si no hay credenciales, entrar directo en modo AP
+  if (wifiSsid.length() == 0) {
+    iniciarModoAP();
+    return;
+  }
+
+  // Primer intento: esperar TIMEOUT_AP_WIFI antes de activar AP
+  if (!intentoWiFiInicial) {
+    inicioIntentoWiFi = millis();
+    intentoWiFiInicial = true;
+    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+    Serial.print(F("Conectando WiFi: "));
+    Serial.println(wifiSsid);
+    return;
+  }
+
+  if (millis() - inicioIntentoWiFi >= TIMEOUT_AP_WIFI) {
+    Serial.println(F("No se pudo conectar. Activando modo AP."));
+    iniciarModoAP();
+    return;
+  }
+
+  // Reintentos periódicos
   if (millis() - ultimoIntentoWifi < INTERVALO_RECONEXION_WIFI) return;
   ultimoIntentoWifi = millis();
 
   Serial.print(F("Reconectando WiFi: "));
   Serial.println(wifiSsid);
-  // No hace falta disconnect + begin constante; setAutoReconnect ya intenta reconectar.
-  // Forzamos un begin solo si no hay intento de reconexion activo.
   if (WiFi.status() == WL_DISCONNECTED || WiFi.status() == WL_NO_SSID_AVAIL) {
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
   }
@@ -375,14 +466,14 @@ unsigned long obtenerUptimeTotal() {
 void calcularDia() {
   unsigned long uptimeTotal = obtenerUptimeTotal();
   diaActual = (int)(uptimeTotal / 86400000UL) + 1;
-  if (diaActual > DIAS_INCUBACION) {
-    diaActual = DIAS_INCUBACION;
+  if (diaActual > perfilActivo.dias_total) {
+    diaActual = perfilActivo.dias_total;
   }
 }
 
 void verificarFase() {
   bool eraLockdown = enLockdown;
-  enLockdown = (diaActual >= DIA_LOCKDOWN);
+  enLockdown = (diaActual >= perfilActivo.dia_lockdown);
 
   if (enLockdown && !eraLockdown) {
     Serial.println(F("*** LOCKDOWN - Dia 18+ ***"));
@@ -397,11 +488,11 @@ void verificarFase() {
 }
 
 float obtenerHumMin() {
-  return enLockdown ? HUM_MIN_LOCKDOWN : HUM_MIN_DESARROLLO;
+  return enLockdown ? perfilActivo.hum_min_lockdown : perfilActivo.hum_min_desarrollo;
 }
 
 float obtenerHumMax() {
-  return enLockdown ? HUM_MAX_LOCKDOWN : HUM_MAX_DESARROLLO;
+  return enLockdown ? perfilActivo.hum_max_lockdown : perfilActivo.hum_max_desarrollo;
 }
 
 // ===================== CONTROL DE ACTUADORES =====================
@@ -409,10 +500,10 @@ float obtenerHumMax() {
 void controlarCalefactor() {
   if (manualCal) return;
 
-  if (temperatura < TEMP_MIN && !estadoCalefactor) {
+  if (temperatura < tempMin && !estadoCalefactor) {
     digitalWrite(PIN_RELAY_HEAT, LOW);
     estadoCalefactor = true;
-  } else if (temperatura > TEMP_MAX && estadoCalefactor) {
+  } else if (temperatura > tempMax && estadoCalefactor) {
     digitalWrite(PIN_RELAY_HEAT, HIGH);
     estadoCalefactor = false;
   }
@@ -455,11 +546,36 @@ void detenerVolteo() {
   ultimoVolteo = obtenerUptimeTotal();
 }
 
+void controlarVentilador() {
+  if (ventiladorManual) return;
+  digitalWrite(PIN_RELAY_FAN, estadoVentilador ? LOW : HIGH);
+}
+
+void encenderVentilador() {
+  estadoVentilador = true;
+  ventiladorManual = false;
+  digitalWrite(PIN_RELAY_FAN, LOW);
+}
+
+void apagarVentilador() {
+  estadoVentilador = false;
+  ventiladorManual = true;
+  digitalWrite(PIN_RELAY_FAN, HIGH);
+}
+
+void toggleVentilador() {
+  if (estadoVentilador) {
+    apagarVentilador();
+  } else {
+    encenderVentilador();
+  }
+}
+
 void verificarVolteo(unsigned long ahora) {
   if (enLockdown) return;
 
   if (motorVolteando) {
-    if (ahora - inicioVolteo >= DURACION_VOLTEO) {
+    if (ahora - inicioVolteo >= perfilActivo.duracion_volteo_ms) {
       detenerVolteo();
     }
     return;
@@ -470,7 +586,7 @@ void verificarVolteo(unsigned long ahora) {
     tv = obtenerUptimeTotal();
   }
 
-  if (obtenerUptimeTotal() - tv >= INTERVALO_VOLTEO) {
+  if (obtenerUptimeTotal() - tv >= perfilActivo.intervalo_volteo_ms) {
     iniciarVolteo();
   }
 }
@@ -497,6 +613,18 @@ void leerSensor() {
   }
 }
 
+void guardarMuestraHistorico(unsigned long ahora) {
+  if (temperatura <= 0.0 && humedad <= 0.0) return;
+  if (ahora - ultimoMuestreoHistorico < INTERVALO_HISTORICO) return;
+  ultimoMuestreoHistorico = ahora;
+
+  historico[historicoIndex].uptime = obtenerUptimeTotal() / 1000UL;
+  historico[historicoIndex].temp = temperatura;
+  historico[historicoIndex].hum = humedad;
+  historicoIndex = (historicoIndex + 1) % MAX_HISTORICO;
+  if (historicoCount < MAX_HISTORICO) historicoCount++;
+}
+
 unsigned long calcularTiempoVolteo() {
   if (enLockdown) return 0;
   unsigned long tv = ultimoVolteo;
@@ -504,8 +632,8 @@ unsigned long calcularTiempoVolteo() {
     tv = obtenerUptimeTotal();
   }
   unsigned long elapsed = obtenerUptimeTotal() - tv;
-  if (elapsed >= INTERVALO_VOLTEO) return 0;
-  return (INTERVALO_VOLTEO - elapsed) / 1000UL;
+  if (elapsed >= perfilActivo.intervalo_volteo_ms) return 0;
+  return (perfilActivo.intervalo_volteo_ms - elapsed) / 1000UL;
 }
 
 // ===================== COMANDOS COMPARTIDOS (SERIAL + BOT) =====================
@@ -555,10 +683,12 @@ void forzarVolteoManual() {
 
 void mostrarInfoSerial() {
   Serial.println(F("--- INFO INCUBADORA ---"));
+  Serial.print(F("Perfil: "));
+  Serial.println(perfilActivo.nombre);
   Serial.print(F("Dia: "));
   Serial.print(diaActual);
   Serial.print(F("/"));
-  Serial.println(DIAS_INCUBACION);
+  Serial.println(perfilActivo.dias_total);
   Serial.print(F("Fase: "));
   Serial.println(enLockdown ? "LOCKDOWN (eclosion)" : "DESARROLLO");
   Serial.print(F("Temp: "));
@@ -578,7 +708,9 @@ void mostrarInfoSerial() {
   Serial.print(F("  Hum: "));
   Serial.print(estadoHumificador ? "ON" : "OFF");
   Serial.print(F("  Motor: "));
-  Serial.println(motorVolteando ? "ON" : "OFF");
+  Serial.print(motorVolteando ? "ON" : "OFF");
+  Serial.print(F("  Fan: "));
+  Serial.println(estadoVentilador ? "ON" : "OFF");
   Serial.print(F("Uptime: "));
   Serial.print(obtenerUptimeTotal() / 3600000UL);
   Serial.println(F(" horas"));
@@ -597,6 +729,7 @@ String obtenerInfoTelegram() {
     unsigned long rest = calcularTiempoVolteo();
     snprintf(buf, sizeof(buf),
       "INCUBADORA AUTOMATICA\n"
+      "Perfil: %s\n"
       "Dia: %d/%d\n"
       "Fase: %s\n"
       "Temp: %.1fC (obj %.1fC)\n"
@@ -604,20 +737,24 @@ String obtenerInfoTelegram() {
       "Calefactor: %s\n"
       "Humificador: %s\n"
       "Motor: %s\n"
+      "Ventilador: %s\n"
       "Prox. volteo: %luh %lum\n"
       "Uptime: %luh",
-      diaActual, DIAS_INCUBACION,
+      perfilActivo.nombre,
+      diaActual, perfilActivo.dias_total,
       enLockdown ? "LOCKDOWN (eclosion)" : "DESARROLLO",
       temperatura, tempObjetivo,
       humedad, obtenerHumMin(), obtenerHumMax(),
       estadoCalefactor ? "ON" : "OFF",
       estadoHumificador ? "ON" : "OFF",
       motorVolteando ? "GIRANDO" : "OFF",
+      estadoVentilador ? "ON" : "OFF",
       rest / 3600, (rest % 3600) / 60,
       uptimeH);
   } else {
     snprintf(buf, sizeof(buf),
       "INCUBADORA AUTOMATICA\n"
+      "Perfil: %s\n"
       "Dia: %d/%d\n"
       "Fase: %s\n"
       "Temp: %.1fC (obj %.1fC)\n"
@@ -625,14 +762,17 @@ String obtenerInfoTelegram() {
       "Calefactor: %s\n"
       "Humificador: %s\n"
       "Motor: %s\n"
+      "Ventilador: %s\n"
       "Uptime: %luh",
-      diaActual, DIAS_INCUBACION,
+      perfilActivo.nombre,
+      diaActual, perfilActivo.dias_total,
       enLockdown ? "LOCKDOWN (eclosion)" : "DESARROLLO",
       temperatura, tempObjetivo,
       humedad, obtenerHumMin(), obtenerHumMax(),
       estadoCalefactor ? "ON" : "OFF",
       estadoHumificador ? "ON" : "OFF",
       motorVolteando ? "GIRANDO" : "OFF",
+      estadoVentilador ? "ON" : "OFF",
       uptimeH);
   }
   return String(buf);
@@ -682,38 +822,50 @@ void handleRoot() {
 }
 
 void handleStatus() {
-  char json[512];
+  char json[768];
   snprintf(json, sizeof(json),
     "{"
     "\"temp\":%.1f,"
     "\"hum\":%.1f,"
     "\"temp_obj\":%.1f,"
+    "\"temp_min\":%.1f,"
+    "\"temp_max\":%.1f,"
     "\"hum_min\":%.1f,"
     "\"hum_max\":%.1f,"
     "\"cal\":%s,"
     "\"humidor\":%s,"
     "\"motor\":%s,"
+    "\"fan\":%s,"
     "\"dia\":%d,"
+    "\"dias_total\":%d,"
+    "\"dia_lockdown\":%d,"
     "\"fase\":\"%s\","
     "\"lockdown\":%s,"
     "\"volteo_restante\":%lu,"
+    "\"perfil\":\"%s\","
+    "\"perfil_id\":%d,"
     "\"wifi\":%s,"
     "\"ip\":\"%s\","
     "\"bot\":%s,"
+    "\"modo_ap\":%s,"
     "\"uptime\":%lu"
     "}",
-    temperatura, humedad, tempObjetivo,
+    temperatura, humedad, tempObjetivo, tempMin, tempMax,
     obtenerHumMin(), obtenerHumMax(),
     estadoCalefactor ? "true" : "false",
     estadoHumificador ? "true" : "false",
     motorVolteando ? "true" : "false",
-    diaActual,
+    estadoVentilador ? "true" : "false",
+    diaActual, perfilActivo.dias_total, perfilActivo.dia_lockdown,
     enLockdown ? "LOCKDOWN" : "DESARROLLO",
     enLockdown ? "true" : "false",
     calcularTiempoVolteo(),
+    perfilActivo.nombre,
+    perfilIdActivo,
     WiFi.status() == WL_CONNECTED ? "true" : "false",
-    WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "",
+    WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : (modoAP ? "192.168.4.1" : ""),
     botListo ? "true" : "false",
+    modoAP ? "true" : "false",
     obtenerUptimeTotal() / 1000UL);
   server.send(200, "application/json", json);
 }
@@ -729,12 +881,28 @@ void handleControl() {
     webCmdHum = true;
   } else if (action == "vol") {
     webCmdVol = true;
+  } else if (action == "fan") {
+    webCmdFan = true;
   } else if (action == "temp_up") {
     webCmdTempUp = true;
   } else if (action == "temp_down") {
     webCmdTempDown = true;
   } else if (action == "temp_set") {
     webCmdTempSet = value.toFloat();
+  } else if (action == "profile") {
+    webCmdProfileId = value.toInt();
+  } else if (action == "custom") {
+    webCmdCustom = true;
+    webCmdCustomParams[0] = server.arg("dias_total").toFloat();
+    webCmdCustomParams[1] = server.arg("dia_lockdown").toFloat();
+    webCmdCustomParams[2] = server.arg("temp_obj").toFloat();
+    webCmdCustomParams[3] = server.arg("temp_min").toFloat();
+    webCmdCustomParams[4] = server.arg("temp_max").toFloat();
+    webCmdCustomParams[5] = server.arg("hum_min_dev").toFloat();
+    webCmdCustomParams[6] = server.arg("hum_max_dev").toFloat();
+    webCmdCustomParams[7] = server.arg("hum_min_lock").toFloat();
+    webCmdCustomParams[8] = server.arg("hum_max_lock").toFloat();
+    webCmdCustomParams[9] = server.arg("intervalo_volteo_h").toFloat();
   } else if (action == "save") {
     webCmdSave = true;
   }
@@ -742,12 +910,106 @@ void handleControl() {
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
+void handleProfiles() {
+  String json = "[";
+  for (int i = 0; i < NUM_PERFILES; i++) {
+    if (i > 0) json += ",";
+    json += "{\"id\":" + String(i) + ",\"nombre\":\"" + String(PERFILES[i].nombre) + "\"}";
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+void handleHistory() {
+  String json = "[";
+  size_t count = historicoCount;
+  if (count > MAX_HISTORICO) count = MAX_HISTORICO;
+  json.reserve(count * 45 + 10);
+  for (size_t i = 0; i < count; i++) {
+    size_t idx = (historicoIndex + MAX_HISTORICO - count + i) % MAX_HISTORICO;
+    if (i > 0) json += ",";
+    json += "{\"t\":" + String(historico[idx].uptime) +
+            ",\"temp\":" + String(historico[idx].temp, 1) +
+            ",\"hum\":" + String(historico[idx].hum, 1) + "}";
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+void handleConfig() {
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+  String token = server.arg("token");
+  String chats = server.arg("chats");
+
+  if (ssid.length() > 0) {
+    wifiSsid = ssid;
+    wifiPass = pass;
+  }
+  if (token.length() > 0) {
+    telegramToken = token;
+    telegramToken.trim();
+  }
+  if (chats.length() > 0) {
+    chatsPermitidos = chats;
+  }
+
+  guardarRed();
+
+  if (ssid.length() > 0) {
+    server.send(200, "application/json", "{\"ok\":true,\"msg\":\"WiFi guardado. Reiniciando...\"}");
+    delay(500);
+    ESP.restart();
+  } else {
+    server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Configuracion guardada.\"}");
+  }
+}
+
 void setupWebServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/control", HTTP_GET, handleControl);
+  server.on("/api/profiles", HTTP_GET, handleProfiles);
+  server.on("/api/history", HTTP_GET, handleHistory);
+  server.on("/api/config", HTTP_POST, handleConfig);
+  server.onNotFound(handleRoot); // Captive portal: cualquier ruta sirve el dashboard
   server.begin();
   Serial.println(F("Servidor web iniciado en puerto 80."));
+}
+
+void aplicarPerfil(int id) {
+  if (id < 0 || id >= NUM_PERFILES) return;
+  perfilIdActivo = id;
+  perfilActivo = PERFILES[id];
+  tempObjetivo = perfilActivo.temp_objetivo;
+  tempMin = perfilActivo.temp_min;
+  tempMax = perfilActivo.temp_max;
+  Serial.print(F("Perfil activo: "));
+  Serial.println(perfilActivo.nombre);
+  guardarEstado();
+}
+
+void aplicarCustomParams() {
+  perfilIdActivo = NUM_PERFILES - 1; // Personalizado
+  perfilActivo = PERFILES[perfilIdActivo];
+  perfilActivo.dias_total = (int)webCmdCustomParams[0];
+  perfilActivo.dia_lockdown = (int)webCmdCustomParams[1];
+  perfilActivo.temp_objetivo = webCmdCustomParams[2];
+  perfilActivo.temp_min = webCmdCustomParams[3];
+  perfilActivo.temp_max = webCmdCustomParams[4];
+  perfilActivo.hum_min_desarrollo = webCmdCustomParams[5];
+  perfilActivo.hum_max_desarrollo = webCmdCustomParams[6];
+  perfilActivo.hum_min_lockdown = webCmdCustomParams[7];
+  perfilActivo.hum_max_lockdown = webCmdCustomParams[8];
+  float horas = webCmdCustomParams[9];
+  if (horas > 0) {
+    perfilActivo.intervalo_volteo_ms = (unsigned long)(horas * 3600UL * 1000UL);
+  }
+  tempObjetivo = perfilActivo.temp_objetivo;
+  tempMin = perfilActivo.temp_min;
+  tempMax = perfilActivo.temp_max;
+  Serial.println(F("Perfil personalizado aplicado."));
+  guardarEstado();
 }
 
 void processWebCommands() {
@@ -763,6 +1025,10 @@ void processWebCommands() {
     forzarVolteoManual();
     webCmdVol = false;
   }
+  if (webCmdFan) {
+    toggleVentilador();
+    webCmdFan = false;
+  }
   if (webCmdTempUp) {
     subirTemp();
     webCmdTempUp = false;
@@ -777,6 +1043,15 @@ void processWebCommands() {
     Serial.print(tempObjetivo, 1);
     Serial.println(F(" C"));
     webCmdTempSet = 0.0;
+  }
+  if (webCmdProfileId >= 0) {
+    aplicarPerfil(webCmdProfileId);
+    webCmdProfileId = -1;
+  }
+  if (webCmdCustom) {
+    aplicarCustomParams();
+    webCmdCustom = false;
+    for (int i = 0; i < 10; i++) webCmdCustomParams[i] = 0;
   }
   if (webCmdSave) {
     guardarEstado();
@@ -935,7 +1210,7 @@ void verificarAlertas() {
   if (!botListo) return;
   if (temperatura <= 0.0) return;
 
-  bool fuera = (temperatura < TEMP_MIN || temperatura > TEMP_MAX);
+  bool fuera = (temperatura < tempMin || temperatura > tempMax);
   if (fuera && !alarmaTemp) {
     alarmaTemp = true;
     notificarTodos("ALERTA: temperatura fuera de rango: " + String(temperatura, 1) + "C");
@@ -1041,13 +1316,19 @@ void dibujarPantalla() {
   gfx->setTextSize(3);
   gfx->println("INCUBADORA");
 
+  // Perfil activo
+  gfx->setTextSize(1);
+  gfx->setCursor(0, 24);
+  gfx->setTextColor(COLOR_CYAN);
+  gfx->print(perfilActivo.nombre);
+
   // ---- TEMPERATURA ----
   gfx->setCursor(0, 32);
   gfx->setTextColor(COLOR_WHITE);
   gfx->setTextSize(2);
   gfx->print("Temperatura");
 
-  if (temperatura >= TEMP_MIN && temperatura <= TEMP_MAX) {
+  if (temperatura >= tempMin && temperatura <= tempMax) {
     gfx->setTextColor(COLOR_GREEN);
   } else {
     gfx->setTextColor(COLOR_RED);
@@ -1133,7 +1414,7 @@ void dibujarPantalla() {
   gfx->print("D");
   gfx->print(diaActual);
   gfx->print("/");
-  gfx->println(DIAS_INCUBACION);
+  gfx->println(perfilActivo.dias_total);
 
   gfx->setTextSize(2);
   gfx->setCursor(0, 248);
@@ -1147,7 +1428,7 @@ void dibujarPantalla() {
 
   // ---- BARRA DE PROGRESO ----
   int barraAncho = 160;
-  int barraProgreso = (int)((float)diaActual / DIAS_INCUBACION * barraAncho);
+  int barraProgreso = (int)((float)diaActual / perfilActivo.dias_total * barraAncho);
   gfx->drawRect(5, 275, barraAncho, 14, COLOR_WHITE);
   if (enLockdown) {
     gfx->fillRect(6, 276, barraProgreso - 1, 12, COLOR_MAGENTA);
@@ -1180,6 +1461,14 @@ void dibujarPantalla() {
     gfx->setCursor(150, 296);
     gfx->setTextColor(COLOR_RED);
     gfx->print("t");
+  }
+  gfx->setCursor(160, 296);
+  if (estadoVentilador) {
+    gfx->setTextColor(COLOR_GREEN);
+    gfx->print("F");
+  } else {
+    gfx->setTextColor(COLOR_RED);
+    gfx->print("f");
   }
 
   // ---- COMANDOS ----
@@ -1357,10 +1646,12 @@ void setup() {
   pinMode(PIN_RELAY_HEAT, OUTPUT);
   pinMode(PIN_RELAY_HUM, OUTPUT);
   pinMode(PIN_RELAY_MOTOR, OUTPUT);
+  pinMode(PIN_RELAY_FAN, OUTPUT);
 
   digitalWrite(PIN_RELAY_HEAT, HIGH);
   digitalWrite(PIN_RELAY_HUM, HIGH);
   digitalWrite(PIN_RELAY_MOTOR, HIGH);
+  digitalWrite(PIN_RELAY_FAN, estadoVentilador ? LOW : HIGH);
 
   // Pantalla
   if (!gfx->begin()) {
@@ -1420,8 +1711,11 @@ void setup() {
     Serial.println(wifiSsid);
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     ultimoIntentoWifi = millis();
+    inicioIntentoWiFi = millis();
+    intentoWiFiInicial = true;
   } else {
-    Serial.println(F("Sin credenciales WiFi. Usa: wifi <ssid> <password>"));
+    Serial.println(F("Sin credenciales WiFi. Modo AP activo."));
+    iniciarModoAP();
   }
 
   if (telegramToken.length() == 0) {
@@ -1434,6 +1728,7 @@ void setup() {
     digitalWrite(PIN_RELAY_HEAT, HIGH);
     digitalWrite(PIN_RELAY_HUM, HIGH);
     digitalWrite(PIN_RELAY_MOTOR, HIGH);
+    digitalWrite(PIN_RELAY_FAN, HIGH);
     Serial.println(F("OTA iniciada..."));
   });
   ArduinoOTA.begin();
@@ -1445,7 +1740,7 @@ void setup() {
   Serial.print(F("Dia: "));
   Serial.print(diaActual);
   Serial.print(F("/"));
-  Serial.println(DIAS_INCUBACION);
+  Serial.println(perfilActivo.dias_total);
   Serial.print(F("Fase: "));
   Serial.println(enLockdown ? "LOCKDOWN" : "DESARROLLO");
   Serial.println(F("Incubadora lista."));
@@ -1482,12 +1777,14 @@ void loop() {
     calcularDia();
     verificarFase();
     verificarAlertas();
+    guardarMuestraHistorico(ahora);
     ultimaLectura = ahora;
   }
 
   // Controlar actuadores
   controlarCalefactor();
   controlarHumificador();
+  controlarVentilador();
   verificarVolteo(ahora);
 
   // Guardar estado periodicamente
