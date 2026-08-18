@@ -1,28 +1,9 @@
 /*
- * Incubadora Automatica v2.0 - ESP32
- * 
- * Componentes:
- *  - ESP32
- *  - Sensor DHT22 (AM2302)
- *  - Modulo Relay 3 canales (calefactor, humificador, motor rodillos)
- *  - Humificador ultrasonico
- *  - Motor rodillos 110V para volteo automatico
- *  - Pantalla TFT ST7789 (170x320 IPS)
+ * Incubadora Automatica - Version Minima Estable
+ * ESP32 + DHT22 + TFT ST7789 + Relay module 3 canales
  *
- * Librerias requeridas:
- *  - AM2302-Sensor
- *  - Arduino_GFX
- *  - UniversalTelegramBot
- *  - ArduinoJson (dependencia del bot)
- *
- * Fases incubacion pollos:
- *  - Dias 1-17:  Desarrollo  (Humedad 50-55%, Volteo ON cada 2h)
- *  - Dias 18-21: Lockdown    (Humedad 65-70%, Volteo OFF)
- *
- * Proteccion contra cortes electricos: Preferences (NVS flash)
- * Comandos serial: +/-:temp temp X h:hum c:cal t:vol s:save d:info r:reset
- * Red:            wifi <ssid> <pass> | token <BOT_TOKEN> | allow/block <chat_id>
- * Bot Telegram:   info, start, help, +, -, temp X, h, c, t, s, reset si
+ * Telegram: solo lectura de estado y alertas por temperatura fuera de rango.
+ * Eliminado: dashboard web, modo AP, OTA, tarea FreeRTOS, perfiles predefinidos.
  */
 
 #include <AM2302-Sensor.h>
@@ -30,12 +11,8 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <WebServer.h>
-#include <DNSServer.h>
 #include <UniversalTelegramBot.h>
-#include <ArduinoOTA.h>
-#include <HTTPClient.h>
-#include <Update.h>
+#include <ArduinoJson.h>
 #include <time.h>
 #include <esp_task_wdt.h>
 
@@ -51,10 +28,10 @@ Arduino_DataBus *bus = new Arduino_ESP32SPI(16, 5, 18, 23);
 Arduino_GFX *gfx = new Arduino_ST7789(bus, 17, 0, true, 170, 320, 35, 0, 35, 0);
 Preferences preferences;
 
-// ===================== RED / BOT =====================
 WiFiClientSecure secured_client;
 UniversalTelegramBot bot("", secured_client);
 
+// ===================== RED / BOT =====================
 String wifiSsid = "";
 String wifiPass = "";
 String telegramToken = "";
@@ -64,7 +41,6 @@ bool tiempoSincronizado = false;
 bool botListo = false;
 bool comandosRegistrados = false;
 bool alarmaTemp = false;
-volatile bool notifyLockdown = false;
 
 // ===================== COLORES =====================
 #define COLOR_BLACK   0x0000
@@ -79,44 +55,28 @@ volatile bool notifyLockdown = false;
 #define COLOR_MAGENTA 0xF81F
 
 // ===================== CONSTANTES =====================
-const unsigned long INTERVALO_LECTURA   = 2000UL;
-const unsigned long INTERVALO_PANTALLA  = 1000UL;
-const unsigned long INTERVALO_GUARDADO  = 60000UL;
-const unsigned long INTERVALO_BOT       = 5000UL;
+const unsigned long INTERVALO_LECTURA    = 2000UL;
+const unsigned long INTERVALO_PANTALLA   = 1000UL;
+const unsigned long INTERVALO_GUARDADO   = 60000UL;
+const unsigned long INTERVALO_BOT        = 30000UL;
 const unsigned long INTERVALO_RECONEXION_WIFI = 30000UL;
-const unsigned long TIMEOUT_AP_WIFI     = 60000UL; // 60s para intentar WiFi antes de activar AP
-// ===================== PERFILES DE INCUBACION =====================
-struct Perfil {
-  const char* nombre;
-  int dias_total;
-  int dia_lockdown;
-  float temp_objetivo;
-  float temp_min;
-  float temp_max;
-  float hum_min_desarrollo;
-  float hum_max_desarrollo;
-  float hum_min_lockdown;
-  float hum_max_lockdown;
-  unsigned long intervalo_volteo_ms;
-  unsigned long duracion_volteo_ms;
-};
+const unsigned long DELAY_ACTUADORES_MS  = 2000UL;
+const unsigned long STAGGER_RELAY_MS     = 150UL;
+const unsigned long MOTOR_TIMEOUT_MS     = 30000UL;
+const int MAX_ERRORES_SENSOR             = 5;
 
-const Perfil PERFILES[] = {
-  {"Pollo",        21, 18, 37.6, 37.5, 37.8, 50.0, 55.0, 65.0, 70.0, 2UL*60UL*60UL*1000UL, 20000UL},
-  {"Codorniz",     18, 14, 37.5, 37.4, 37.8, 45.0, 50.0, 60.0, 65.0, 2UL*60UL*60UL*1000UL, 20000UL},
-  {"Pavo",         28, 25, 37.5, 37.4, 37.8, 50.0, 55.0, 65.0, 70.0, 2UL*60UL*60UL*1000UL, 25000UL},
-  {"Pato",         28, 25, 37.5, 37.4, 37.8, 55.0, 60.0, 70.0, 75.0, 2UL*60UL*60UL*1000UL, 25000UL},
-  {"Personalizado",21, 18, 37.6, 37.5, 37.8, 50.0, 55.0, 65.0, 70.0, 2UL*60UL*60UL*1000UL, 20000UL}
-};
-const int NUM_PERFILES = sizeof(PERFILES) / sizeof(PERFILES[0]);
-
-Perfil perfilActivo = PERFILES[0];
-int perfilIdActivo = 0;
-
-// Parámetros editables (copia del perfil activo, usado también para personalizado)
-float tempObjetivo = 37.5;
-float tempMin      = 37.5;
-float tempMax      = 37.8;
+// ===================== PARAMETROS PERSONALIZADOS =====================
+float tempObjetivo      = 37.6;
+float tempMin           = 37.5;
+float tempMax           = 37.8;
+float humMinDesarrollo  = 50.0;
+float humMaxDesarrollo  = 55.0;
+float humMinLockdown    = 65.0;
+float humMaxLockdown    = 70.0;
+int diasTotal           = 21;
+int diaLockdown         = 18;
+unsigned long intervaloVolteoMs = 2UL * 60UL * 60UL * 1000UL;
+unsigned long duracionVolteoMs  = 20000UL;
 
 // ===================== VARIABLES DE ESTADO =====================
 float temperatura = 0.0;
@@ -133,188 +93,88 @@ unsigned long ultimaLectura = 0;
 unsigned long ultimaPantalla = 0;
 unsigned long ultimaGuardado = 0;
 unsigned long ultimoBot = 0;
-unsigned long inicioIncubacion = 0;
 unsigned long uptimeAcumulado = 0;
 unsigned long millisEnUltimoGuardado = 0;
-
-
-int diaActual = 0;
-
-bool manualCal = false;
-bool manualHum = false;
-
-// ===================== DISPLAY / SENSOR INIT =====================
-bool displayOk = false;
-bool sensorCalentando = true;
-int sensorWarmupCount = 0;
-bool actuadoresListos = false;
 unsigned long millisArranque = 0;
-const unsigned long DELAY_ACTUADORES_MS = 2000UL; // espera rail + sensor antes de actuadores
-const unsigned long STAGGER_RELAY_MS = 150UL;     // no activar varias bobinas a la vez
-bool sensorValido = false;
 unsigned long ultimoCambioRelay = 0;
 
-// ===================== MODO AP / CONFIGURACION =====================
-bool modoAP = false;
-bool intentoWiFiInicial = false;
-unsigned long inicioIntentoWiFi = 0;
-DNSServer dnsServer;
-const char* AP_SSID = "Incubadora-Setup";
-const char* AP_PASS = "incubadora123";
+int diaActual = 0;
+bool manualCal = false;
+bool manualHum = false;
+bool sensorValido = false;
+int erroresSensor = 0;
 
-// ===================== WEB SERVER DASHBOARD =====================
-WebServer server(80);
+bool displayOk = false;
+bool actuadoresListos = false;
 
-volatile bool webCmdCal = false;
-volatile bool webCmdHum = false;
-volatile bool webCmdVol = false;
-volatile bool webCmdTempUp = false;
-volatile bool webCmdTempDown = false;
-volatile bool webCmdSave = false;
-volatile float webCmdTempSet = 0.0;
-volatile int webCmdProfileId = -1;
-volatile bool webCmdCustom = false;
-volatile float webCmdCustomParams[10] = {0};
-
-const char DASHBOARD_HTML[] PROGMEM =
-  "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>Dashboard Incubadora</title><style> :root { --bg: #0f1115; --card: #181b21; --text: #e0e0e0; --muted: #888; --green: #00c853; --red: #ff1744; --yellow: #ffd600; --cyan: #00e5ff; --magenta: #e040fb; --blue: #2979ff; --orange: #ff9100; } * { box-sizing: border-box; } body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 16px; line-height: 1.4; } h1 { text-align: center; margin: 0 0 16px; font-size: 1.5rem; color: var(--yellow); } .tabs { display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 1px solid #2a2f36; padding-bottom: 8px; } .tab-btn { flex: 1; background: transparent; border: none; color: var(--muted); padding: 10px; font-size: 0.95rem; cursor: pointer; border-radius: 8px; transition: all 0.2s; } .tab-btn.active { background: var(--card); color: var(--text); } .tab-content { display: none; } .tab-content.active { display: block; } .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; } .card { background: var(--card); border-radius: 12px; padding: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.3); margin-bottom: 12px; } .card h3 { margin: 0 0 10px; font-size: 0.8rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.5px; } .value { font-size: 2.2rem; font-weight: 700; margin: 4px 0; } .target { font-size: 0.8rem; color: var(--muted); } .status { margin-top: 8px; font-size: 0.9rem; font-weight: 600; } .ok { color: var(--green); } .bad { color: var(--red); } .warn { color: var(--yellow); } .cyan { color: var(--cyan); } .magenta { color: var(--magenta); } .blue { color: var(--blue); } .orange { color: var(--orange); } .full { grid-column: 1 / -1; } .progress-bar { width: 100%; height: 18px; background: #2a2f36; border-radius: 9px; overflow: hidden; margin-top: 10px; } .progress-fill { height: 100%; background: var(--green); transition: width 0.5s ease; } .progress-fill.lockdown { background: var(--magenta); } .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; } button, input[type=submit] { background: #2a2f36; color: var(--text); border: 1px solid #3a4049; border-radius: 8px; padding: 10px 14px; font-size: 0.9rem; cursor: pointer; transition: background 0.2s; } button:hover, input[type=submit]:hover { background: #3a4049; } button:active { transform: scale(0.98); } button.on { background: var(--green); color: #000; border-color: var(--green); } button.off { background: var(--red); color: #fff; border-color: var(--red); } .form-group { margin-bottom: 12px; } label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 4px; } input, select { width: 100%; background: #2a2f36; color: var(--text); border: 1px solid #3a4049; border-radius: 8px; padding: 10px; font-size: 0.95rem; } .system-info { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 0.9rem; } .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--card); color: var(--text); padding: 10px 18px; border-radius: 8px; border: 1px solid #3a4049; display: none; z-index: 100; } @media (max-width: 400px) { .grid { grid-template-columns: 1fr; } .system-info { grid-template-columns: 1fr; } .value { font-size: 2rem; } } </style></head><body><h1>Dashboard Incubadora</h1><div class=\"tabs\"><button class=\"tab-btn active\" onclick=\"showTab('estado')\">Estado</button><button class=\"tab-btn\" onclick=\"showTab('config')\">Configuración</button></div><div id=\"estado\" class=\"tab-content active\"><div class=\"card full\"><h3>Perfil de Incubación</h3><div class=\"controls\"><select id=\"perfil-select\" onchange=\"cambiarPerfil(this.value)\"><option value=\"0\">Pollo</option><option value=\"1\">Codorniz</option><option value=\"2\">Pavo</option><option value=\"3\">Pato</option><option value=\"4\">Personalizado</option></select></div><div class=\"target\" style=\"margin-top:8px\">Especies: <span id=\"perfil-nombre\">--</span></div></div><div class=\"grid\"><div class=\"card\"><h3>Temperatura</h3><div class=\"value\" id=\"temp\">--</div><div class=\"target\" id=\"temp-target\">Objetivo: --</div><div class=\"status\" id=\"cal-status\">CAL: --</div></div><div class=\"card\"><h3>Humedad</h3><div class=\"value\" id=\"hum\">--</div><div class=\"target\" id=\"hum-target\">Objetivo: --</div><div class=\"status\" id=\"hum-status\">HUM: --</div></div><div class=\"card\"><h3>Sistema</h3><div class=\"system-info\"><div>WiFi: <span id=\"wifi\">--</span></div><div>IP: <span id=\"ip\">--</span></div><div>Bot: <span id=\"bot\">--</span></div><div>Modo: <span id=\"modo\">--</span></div></div></div></div><div class=\"card full\"><h3>Progreso de Incubación</h3><div> Día <strong id=\"dia\">--</strong>/<strong id=\"dias-total\">--</strong> - <span id=\"fase\" class=\"ok\">--</span></div><div class=\"progress-bar\"><div class=\"progress-fill\" id=\"progress\" style=\"width:0%\"></div></div><div class=\"target\" style=\"margin-top:6px\">Uptime: <span id=\"uptime\">--</span></div></div><div class=\"card full\"><h3>Volteo</h3><div id=\"volteo\" class=\"cyan\">--</div></div><div class=\"card full\"><h3>Control Manual</h3><div class=\"controls\"><button onclick=\"sendCmd('temp_up')\">+ Temp</button><button onclick=\"sendCmd('temp_down')\">- Temp</button><button onclick=\"sendCmd('cal')\">Calefactor</button><button onclick=\"sendCmd('hum')\">Humificador</button><button onclick=\"sendCmd('vol')\">Forzar Volteo</button><button onclick=\"sendCmd('save')\">Guardar Estado</button></div></div><div class=\"card full\"><h3>Última actualización</h3><div class=\"target\" id=\"last-update\">--</div></div></div><div id=\"config\" class=\"tab-content\"><div class=\"card full\"><h3>Configuración WiFi</h3><form onsubmit=\"guardarConfig(event)\"><div class=\"form-group\"><label>SSID</label><input type=\"text\" id=\"cfg-ssid\" placeholder=\"Nombre de red\" required></div><div class=\"form-group\"><label>Contraseña</label><input type=\"password\" id=\"cfg-pass\" placeholder=\"Contraseña\"></div><div class=\"form-group\"><label>Token Bot Telegram</label><input type=\"text\" id=\"cfg-token\" placeholder=\"Opcional\"></div><div class=\"form-group\"><label>Chat IDs permitidos (separados por coma)</label><input type=\"text\" id=\"cfg-chats\" placeholder=\"Opcional\"></div><input type=\"submit\" value=\"Guardar y reiniciar\"></form></div><div class=\"card full\" id=\"custom-panel\" style=\"display:none\"><h3>Parámetros Personalizados</h3><form onsubmit=\"guardarCustom(event)\"><div class=\"grid\"><div class=\"form-group\"><label>Días totales</label><input type=\"number\" id=\"c-dias\" value=\"21\" required></div><div class=\"form-group\"><label>Día lockdown</label><input type=\"number\" id=\"c-lockdown\" value=\"18\" required></div><div class=\"form-group\"><label>Temp objetivo</label><input type=\"number\" step=\"0.1\" id=\"c-temp-obj\" value=\"37.6\" required></div><div class=\"form-group\"><label>Temp mínima</label><input type=\"number\" step=\"0.1\" id=\"c-temp-min\" value=\"37.5\" required></div><div class=\"form-group\"><label>Temp máxima</label><input type=\"number\" step=\"0.1\" id=\"c-temp-max\" value=\"37.8\" required></div><div class=\"form-group\"><label>Hum mín desarrollo</label><input type=\"number\" step=\"0.1\" id=\"c-hum-min-dev\" value=\"50\" required></div><div class=\"form-group\"><label>Hum máx desarrollo</label><input type=\"number\" step=\"0.1\" id=\"c-hum-max-dev\" value=\"55\" required></div><div class=\"form-group\"><label>Hum mín lockdown</label><input type=\"number\" step=\"0.1\" id=\"c-hum-min-lock\" value=\"65\" required></div><div class=\"form-group\"><label>Hum máx lockdown</label><input type=\"number\" step=\"0.1\" id=\"c-hum-max-lock\" value=\"70\" required></div><div class=\"form-group\"><label>Intervalo volteo (horas)</label><input type=\"number\" step=\"0.5\" id=\"c-volteo\" value=\"2\" required></div></div><input type=\"submit\" value=\"Aplicar personalizado\"></form></div></div><div class=\"toast\" id=\"toast\"></div><script> let currentData = {}; const fmtTime = s => { if (s < 60) return s + 's'; if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's'; const h = Math.floor(s/3600); const m = Math.floor((s%3600)/60); return h + 'h ' + m + 'm'; }; function showTab(id) { document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active')); document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active')); document.getElementById(id).classList.add('active'); event.target.classList.add('active'); } function toast(msg) { const t = document.getElementById('toast'); t.textContent = msg; t.style.display = 'block'; setTimeout(() => t.style.display = 'none', 2500); } async function update() { try { const res = await fetch('/api/status'); const d = await res.json(); currentData = d; document.getElementById('temp').textContent = d.temp.toFixed(1) + '°C'; document.getElementById('temp').className = 'value ' + ((d.temp >= d.temp_min && d.temp <= d.temp_max) ? 'ok' : 'bad'); document.getElementById('temp-target').textContent = 'Objetivo: ' + d.temp_obj.toFixed(1) + '°C (' + d.temp_min.toFixed(1) + '-' + d.temp_max.toFixed(1) + ')'; const cal = document.getElementById('cal-status'); cal.textContent = 'CAL: ' + (d.cal ? 'ON' : 'OFF'); cal.className = 'status ' + (d.cal ? 'ok' : 'bad'); document.getElementById('hum').textContent = d.hum.toFixed(1) + '%'; document.getElementById('hum').className = 'value ' + ((d.hum >= d.hum_min && d.hum <= d.hum_max) ? 'ok' : 'warn'); document.getElementById('hum-target').textContent = 'Objetivo: ' + d.hum_min.toFixed(0) + '-' + d.hum_max.toFixed(0) + '%'; const hum = document.getElementById('hum-status'); hum.textContent = 'HUM: ' + (d.humidor ? 'ON' : 'OFF'); hum.className = 'status ' + (d.humidor ? 'ok' : 'bad'); document.getElementById('perfil-select').value = d.perfil_id; document.getElementById('perfil-nombre').textContent = d.perfil; document.getElementById('custom-panel').style.display = (d.perfil_id == 4) ? 'block' : 'none'; document.getElementById('dia').textContent = d.dia; document.getElementById('dias-total').textContent = d.dias_total; document.getElementById('fase').textContent = d.fase; document.getElementById('fase').className = d.lockdown ? 'magenta' : 'ok'; document.getElementById('progress').style.width = ((d.dia / d.dias_total) * 100) + '%'; document.getElementById('progress').className = 'progress-fill' + (d.lockdown ? ' lockdown' : ''); const vol = document.getElementById('volteo'); if (d.lockdown) { vol.textContent = 'LOCKDOWN - Volteo detenido'; vol.className = 'magenta'; } else if (d.motor) { vol.textContent = 'GIRANDO'; vol.className = 'warn'; } else { vol.textContent = 'Próximo volteo: ' + fmtTime(d.volteo_restante); vol.className = 'cyan'; } const wifi = document.getElementById('wifi'); wifi.textContent = d.wifi ? 'Conectado' : 'Desconectado'; wifi.className = d.wifi ? 'ok' : 'bad'; document.getElementById('ip').textContent = d.ip || '---'; const bot = document.getElementById('bot'); bot.textContent = d.bot ? 'Activo' : 'Inactivo'; bot.className = d.bot ? 'ok' : 'bad'; const modo = document.getElementById('modo'); modo.textContent = d.modo_ap ? 'AP' : 'STA'; modo.className = d.modo_ap ? 'warn' : 'cyan'; document.getElementById('uptime').textContent = Math.floor(d.uptime / 3600) + 'h'; document.getElementById('last-update').textContent = new Date().toLocaleTimeString(); } catch (e) { console.error('Error actualizando:', e); document.getElementById('last-update').textContent = 'Error de conexión'; } } async function sendCmd(action, value) { try { await fetch('/api/control?action=' + encodeURIComponent(action) + (value ? '&value=' + encodeURIComponent(value) : '')); toast('Comando enviado'); setTimeout(update, 300); } catch (e) { toast('Error enviando comando'); } } async function cambiarPerfil(id) { await sendCmd('profile', id); } async function guardarConfig(e) { e.preventDefault(); const ssid = document.getElementById('cfg-ssid').value; const pass = document.getElementById('cfg-pass').value; const token = document.getElementById('cfg-token').value; const chats = document.getElementById('cfg-chats').value; try { const res = await fetch('/api/config', { method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body: 'ssid=' + encodeURIComponent(ssid) + '&pass=' + encodeURIComponent(pass) + '&token=' + encodeURIComponent(token) + '&chats=' + encodeURIComponent(chats) }); const d = await res.json(); toast(d.msg); } catch (e) { toast('Error guardando configuración'); } } async function guardarCustom(e) { e.preventDefault(); const params = { dias_total: document.getElementById('c-dias').value, dia_lockdown: document.getElementById('c-lockdown').value, temp_obj: document.getElementById('c-temp-obj').value, temp_min: document.getElementById('c-temp-min').value, temp_max: document.getElementById('c-temp-max').value, hum_min_dev: document.getElementById('c-hum-min-dev').value, hum_max_dev: document.getElementById('c-hum-max-dev').value, hum_min_lock: document.getElementById('c-hum-min-lock').value, hum_max_lock: document.getElementById('c-hum-max-lock').value, intervalo_volteo_h: document.getElementById('c-volteo').value }; let qs = 'action=custom'; for (let k in params) qs += '&' + k + '=' + encodeURIComponent(params[k]); try { await fetch('/api/control?' + qs); toast('Personalizado aplicado'); setTimeout(update, 300); } catch (e) { toast('Error aplicando personalizado'); } } update(); setInterval(update, 3000); </script></body></html>";
-
-
-// ===================== TAREA TELEGRAM (CORE 0) =====================
-// La tarea de Telegram corre en core 0 para no bloquear el loop principal (core 1).
-// Si Telegram se bloquea por red, el control de actuadores sigue funcionando.
-
-enum TelegramCmdType {
-  TCMD_NONE = 0,
-  TCMD_SUBIR_TEMP,
-  TCMD_BAJAR_TEMP,
-  TCMD_SET_TEMP,
-  TCMD_TOGGLE_HUM,
-  TCMD_TOGGLE_CAL,
-  TCMD_FORZAR_VOLTEO,
-  TCMD_SAVE,
-  TCMD_RESET,
-  TCMD_APLICAR_PERFIL
-};
-
-struct TelegramCmdMsg {
-  TelegramCmdType cmd;
-  float value;
-};
-
-QueueHandle_t telegramCmdQueue = NULL;
-SemaphoreHandle_t stateMutex = NULL;
-
-struct StateSnapshot {
-  float temperatura;
-  float humedad;
-  float tempObjetivo;
-  float tempMin;
-  float tempMax;
-  float humMin;
-  float humMax;
-  bool estadoCalefactor;
-  bool estadoHumificador;
-  bool motorVolteando;
-  bool enLockdown;
-  int diaActual;
-  int perfilDiasTotal;
-  int perfilIdActivo;
-  const char* perfilNombre;
-  unsigned long uptime;
-  unsigned long tiempoVolteoRestante;
-};
-
-StateSnapshot snap;
-TaskHandle_t telegramTaskHandle = NULL;
-
-// ===================== PERSISTENCIA (PROTECCION CORTE) =====================
-
+// ===================== PERSISTENCIA =====================
 void guardarEstado() {
   preferences.begin("incubadora", false);
-
   unsigned long uptimeTotal = uptimeAcumulado + millis();
   preferences.putULong("uptime", uptimeTotal);
   preferences.putULong("ultimoVol", ultimoVolteo);
   preferences.putBool("manCal", manualCal);
   preferences.putBool("manHum", manualHum);
-
-  // Guardar perfil activo y parámetros personalizados
-  preferences.putInt("perfilId", perfilIdActivo);
-  preferences.putInt("p_dias_total", perfilActivo.dias_total);
-  preferences.putInt("p_dia_lockdown", perfilActivo.dia_lockdown);
-  preferences.putFloat("p_temp_obj", perfilActivo.temp_objetivo);
-  preferences.putFloat("p_temp_min", perfilActivo.temp_min);
-  preferences.putFloat("p_temp_max", perfilActivo.temp_max);
-  preferences.putFloat("p_hum_min_dev", perfilActivo.hum_min_desarrollo);
-  preferences.putFloat("p_hum_max_dev", perfilActivo.hum_max_desarrollo);
-  preferences.putFloat("p_hum_min_lock", perfilActivo.hum_min_lockdown);
-  preferences.putFloat("p_hum_max_lock", perfilActivo.hum_max_lockdown);
-  preferences.putULong("p_int_volteo", perfilActivo.intervalo_volteo_ms);
-  preferences.putULong("p_dur_volteo", perfilActivo.duracion_volteo_ms);
-
+  preferences.putFloat("tempObj", tempObjetivo);
+  preferences.putFloat("tempMin", tempMin);
+  preferences.putFloat("tempMax", tempMax);
+  preferences.putFloat("humMinDev", humMinDesarrollo);
+  preferences.putFloat("humMaxDev", humMaxDesarrollo);
+  preferences.putFloat("humMinLock", humMinLockdown);
+  preferences.putFloat("humMaxLock", humMaxLockdown);
+  preferences.putInt("diasTotal", diasTotal);
+  preferences.putInt("diaLockdown", diaLockdown);
+  preferences.putULong("intVolteo", intervaloVolteoMs);
+  preferences.putULong("durVolteo", duracionVolteoMs);
   preferences.end();
-  Serial.println(F("Estado guardado."));
 }
 
 void cargarEstado() {
   preferences.begin("incubadora", true);
-
   unsigned long uptimeGuardado = preferences.getULong("uptime", 0);
   ultimoVolteo = preferences.getULong("ultimoVol", 0);
   manualCal = preferences.getBool("manCal", false);
   manualHum = preferences.getBool("manHum", false);
-
-  perfilIdActivo = preferences.getInt("perfilId", 0);
-  if (perfilIdActivo < 0 || perfilIdActivo >= NUM_PERFILES) perfilIdActivo = 0;
-
-  // Cargar parámetros personalizados si existen; si no, usar valores por defecto
-  Perfil base = PERFILES[perfilIdActivo];
-  perfilActivo.nombre = base.nombre;
-  perfilActivo.dias_total = preferences.getInt("p_dias_total", base.dias_total);
-  perfilActivo.dia_lockdown = preferences.getInt("p_dia_lockdown", base.dia_lockdown);
-  perfilActivo.temp_objetivo = preferences.getFloat("p_temp_obj", base.temp_objetivo);
-  perfilActivo.temp_min = preferences.getFloat("p_temp_min", base.temp_min);
-  perfilActivo.temp_max = preferences.getFloat("p_temp_max", base.temp_max);
-  perfilActivo.hum_min_desarrollo = preferences.getFloat("p_hum_min_dev", base.hum_min_desarrollo);
-  perfilActivo.hum_max_desarrollo = preferences.getFloat("p_hum_max_dev", base.hum_max_desarrollo);
-  perfilActivo.hum_min_lockdown = preferences.getFloat("p_hum_min_lock", base.hum_min_lockdown);
-  perfilActivo.hum_max_lockdown = preferences.getFloat("p_hum_max_lock", base.hum_max_lockdown);
-  perfilActivo.intervalo_volteo_ms = preferences.getULong("p_int_volteo", base.intervalo_volteo_ms);
-  perfilActivo.duracion_volteo_ms = preferences.getULong("p_dur_volteo", base.duracion_volteo_ms);
-
+  tempObjetivo     = preferences.getFloat("tempObj", tempObjetivo);
+  tempMin          = preferences.getFloat("tempMin", tempMin);
+  tempMax          = preferences.getFloat("tempMax", tempMax);
+  humMinDesarrollo = preferences.getFloat("humMinDev", humMinDesarrollo);
+  humMaxDesarrollo = preferences.getFloat("humMaxDev", humMaxDesarrollo);
+  humMinLockdown   = preferences.getFloat("humMinLock", humMinLockdown);
+  humMaxLockdown   = preferences.getFloat("humMaxLock", humMaxLockdown);
+  diasTotal        = preferences.getInt("diasTotal", diasTotal);
+  diaLockdown      = preferences.getInt("diaLockdown", diaLockdown);
+  intervaloVolteoMs = preferences.getULong("intVolteo", intervaloVolteoMs);
+  duracionVolteoMs  = preferences.getULong("durVolteo", duracionVolteoMs);
   preferences.end();
-
   uptimeAcumulado = uptimeGuardado;
   millisEnUltimoGuardado = millis();
-
-  // Aplicar parámetros editables
-  tempObjetivo = perfilActivo.temp_objetivo;
-  tempMin = perfilActivo.temp_min;
-  tempMax = perfilActivo.temp_max;
 }
 
 void borrarEstado() {
   preferences.begin("incubadora", false);
   preferences.clear();
   preferences.end();
-
   uptimeAcumulado = 0;
-  inicioIncubacion = millis();
-  ultimoVolteo = millis();
+  ultimoVolteo = 0;
   millisEnUltimoGuardado = millis();
   manualCal = false;
   manualHum = false;
-  perfilIdActivo = 0;
-  perfilActivo = PERFILES[0];
-  tempObjetivo = perfilActivo.temp_objetivo;
-  tempMin = perfilActivo.temp_min;
-  tempMax = perfilActivo.temp_max;
-
+  tempObjetivo      = 37.6;
+  tempMin           = 37.5;
+  tempMax           = 37.8;
+  humMinDesarrollo  = 50.0;
+  humMaxDesarrollo  = 55.0;
+  humMinLockdown    = 65.0;
+  humMaxLockdown    = 70.0;
+  diasTotal         = 21;
+  diaLockdown       = 18;
+  intervaloVolteoMs = 2UL * 60UL * 60UL * 1000UL;
+  duracionVolteoMs  = 20000UL;
   Serial.println(F("Estado borrado. Reiniciando."));
+  delay(500);
+  ESP.restart();
 }
-
-// ===================== PERSISTENCIA DE RED / BOT =====================
 
 void guardarRed() {
   preferences.begin("incubadora", false);
@@ -335,7 +195,6 @@ void cargarRed() {
 }
 
 // ===================== WIFI =====================
-
 void configurarWifi(const String& ssid, const String& pass) {
   wifiSsid = ssid;
   wifiPass = pass;
@@ -345,75 +204,21 @@ void configurarWifi(const String& ssid, const String& pass) {
   WiFi.disconnect();
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
   ultimoIntentoWifi = millis();
-  inicioIntentoWiFi = millis();
-  intentoWiFiInicial = true;
-}
-
-void iniciarModoAP() {
-  if (modoAP) return;
-  Serial.println(F("Iniciando modo AP..."));
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  dnsServer.start(53, "*", WiFi.softAPIP());
-  modoAP = true;
-  Serial.print(F("AP: "));
-  Serial.println(AP_SSID);
-  Serial.print(F("IP: "));
-  Serial.println(WiFi.softAPIP());
-}
-
-void detenerModoAP() {
-  if (!modoAP) return;
-  Serial.println(F("Cerrando modo AP..."));
-  dnsServer.stop();
-  WiFi.softAPdisconnect(true);
-  modoAP = false;
 }
 
 void gestionarWifi() {
   static bool ntpArrancado = false;
-
-  if (modoAP) {
-    dnsServer.processNextRequest();
-    return;
-  }
-
   if (WiFi.status() == WL_CONNECTED) {
     if (!ntpArrancado) {
       configTime(0, 0, "pool.ntp.org");
       ntpArrancado = true;
     }
     ultimoIntentoWifi = millis();
-    inicioIntentoWiFi = millis();
     return;
   }
-
-  // Si no hay credenciales, entrar directo en modo AP
-  if (wifiSsid.length() == 0) {
-    iniciarModoAP();
-    return;
-  }
-
-  // Primer intento: esperar TIMEOUT_AP_WIFI antes de activar AP
-  if (!intentoWiFiInicial) {
-    inicioIntentoWiFi = millis();
-    intentoWiFiInicial = true;
-    WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
-    Serial.print(F("Conectando WiFi: "));
-    Serial.println(wifiSsid);
-    return;
-  }
-
-  if (millis() - inicioIntentoWiFi >= TIMEOUT_AP_WIFI) {
-    Serial.println(F("No se pudo conectar. Activando modo AP."));
-    iniciarModoAP();
-    return;
-  }
-
-  // Reintentos periódicos
+  if (wifiSsid.length() == 0) return;
   if (millis() - ultimoIntentoWifi < INTERVALO_RECONEXION_WIFI) return;
   ultimoIntentoWifi = millis();
-
   Serial.print(F("Reconectando WiFi: "));
   Serial.println(wifiSsid);
   if (WiFi.status() == WL_DISCONNECTED || WiFi.status() == WL_NO_SSID_AVAIL) {
@@ -423,12 +228,8 @@ void gestionarWifi() {
 
 void mostrarEstadoWifi() {
   Serial.println(F("--- RED ---"));
-  if (wifiSsid.length() > 0) {
-    Serial.print(F("SSID: "));
-    Serial.println(wifiSsid);
-  } else {
-    Serial.println(F("SSID: (no configurado)"));
-  }
+  Serial.print(F("SSID: "));
+  Serial.println(wifiSsid.length() > 0 ? wifiSsid : "(no configurado)");
   Serial.print(F("Estado: "));
   Serial.println(WiFi.status() == WL_CONNECTED ? "CONECTADO" : "DESCONECTADO");
   if (WiFi.status() == WL_CONNECTED) {
@@ -442,7 +243,6 @@ void mostrarEstadoWifi() {
 }
 
 // ===================== CHATS PERMITIDOS =====================
-
 bool chatPermitido(const String& id) {
   String resto = chatsPermitidos;
   while (resto.length() > 0) {
@@ -485,8 +285,6 @@ void quitarChat(const String& id) {
   Serial.println(id);
 }
 
-// ===================== TOKEN TELEGRAM =====================
-
 void configurarToken(const String& tok) {
   telegramToken = tok;
   telegramToken.trim();
@@ -497,7 +295,6 @@ void configurarToken(const String& tok) {
 }
 
 // ===================== LOGICA DE FASES =====================
-
 unsigned long obtenerUptimeTotal() {
   return uptimeAcumulado + millis();
 }
@@ -505,37 +302,27 @@ unsigned long obtenerUptimeTotal() {
 void calcularDia() {
   unsigned long uptimeTotal = obtenerUptimeTotal();
   diaActual = (int)(uptimeTotal / 86400000UL) + 1;
-  if (diaActual > perfilActivo.dias_total) {
-    diaActual = perfilActivo.dias_total;
-  }
+  if (diaActual > diasTotal) diaActual = diasTotal;
 }
 
 void verificarFase() {
   bool eraLockdown = enLockdown;
-  enLockdown = (diaActual >= perfilActivo.dia_lockdown);
-
+  enLockdown = (diaActual >= diaLockdown);
   if (enLockdown && !eraLockdown) {
-    Serial.println(F("*** LOCKDOWN - Dia 18+ ***"));
-    Serial.println(F("Volteo DETENIDO. Humedad: 65-70%"));
-    if (motorVolteando) {
-      detenerVolteo();
-    }
-    // Flag para que la tarea de Telegram envíe la notificación (sin bloquear core 1)
-    notifyLockdown = true;
+    Serial.println(F("*** LOCKDOWN ***"));
+    if (motorVolteando) detenerVolteo();
   }
 }
 
 float obtenerHumMin() {
-  return enLockdown ? perfilActivo.hum_min_lockdown : perfilActivo.hum_min_desarrollo;
+  return enLockdown ? humMinLockdown : humMinDesarrollo;
 }
 
 float obtenerHumMax() {
-  return enLockdown ? perfilActivo.hum_max_lockdown : perfilActivo.hum_max_desarrollo;
+  return enLockdown ? humMaxLockdown : humMaxDesarrollo;
 }
 
 // ===================== CONTROL DE ACTUADORES =====================
-
-// Relays activos en LOW. HIGH antes de pinMode evita pico de corriente al boot.
 void relaysInitSeguro() {
   digitalWrite(PIN_RELAY_HEAT, HIGH);
   digitalWrite(PIN_RELAY_HUM, HIGH);
@@ -562,9 +349,15 @@ bool relayPuedeCambiar() {
   return true;
 }
 
+void apagarActuadoresSeguro() {
+  digitalWrite(PIN_RELAY_HEAT, HIGH);
+  digitalWrite(PIN_RELAY_HUM, HIGH);
+  estadoCalefactor = false;
+  estadoHumificador = false;
+}
+
 void controlarCalefactor() {
   if (!actuadoresListos || !sensorValido || manualCal) return;
-
   if (temperatura < tempMin && !estadoCalefactor) {
     if (!relayPuedeCambiar()) return;
     digitalWrite(PIN_RELAY_HEAT, LOW);
@@ -578,23 +371,8 @@ void controlarCalefactor() {
 
 void controlarHumificador() {
   if (!actuadoresListos || !sensorValido) return;
-
   float humMin = obtenerHumMin();
   float humMax = obtenerHumMax();
-
-  if (manualHum) {
-    if (humedad < humMin && !estadoHumificador) {
-      if (!relayPuedeCambiar()) return;
-      digitalWrite(PIN_RELAY_HUM, LOW);
-      estadoHumificador = true;
-    } else if (humedad > humMax && estadoHumificador) {
-      if (!relayPuedeCambiar()) return;
-      digitalWrite(PIN_RELAY_HUM, HIGH);
-      estadoHumificador = false;
-    }
-    return;
-  }
-
   if (humedad < humMin && !estadoHumificador) {
     if (!relayPuedeCambiar()) return;
     digitalWrite(PIN_RELAY_HUM, LOW);
@@ -623,20 +401,17 @@ void detenerVolteo() {
 
 void verificarVolteo(unsigned long ahora) {
   if (enLockdown) return;
-
   if (motorVolteando) {
-    if (ahora - inicioVolteo >= perfilActivo.duracion_volteo_ms) {
+    if (ahora - inicioVolteo >= duracionVolteoMs) {
       detenerVolteo();
     }
     return;
   }
-
   unsigned long tv = ultimoVolteo;
   if (tv == 0 || tv > obtenerUptimeTotal()) {
     tv = obtenerUptimeTotal();
   }
-
-  if (obtenerUptimeTotal() - tv >= perfilActivo.intervalo_volteo_ms) {
+  if (obtenerUptimeTotal() - tv >= intervaloVolteoMs) {
     iniciarVolteo();
   }
 }
@@ -645,17 +420,20 @@ void leerSensor() {
   unsigned long t0 = millis();
   auto status = am2302.read();
   unsigned long duracion = millis() - t0;
-
   if (status == AM2302::AM2302_READ_OK) {
     float t = am2302.get_Temperature();
     float h = am2302.get_Humidity();
     if (t >= 10.0 && t <= 50.0 && h >= 5.0 && h <= 100.0) {
       temperatura = t;
       humedad = h;
+      erroresSensor = 0;
       if (!sensorValido) {
         sensorValido = true;
         Serial.println(F("Sensor DHT22 valido."));
       }
+    } else {
+      erroresSensor++;
+      Serial.println(F("Lectura DHT fuera de rango."));
     }
     if (duracion > 500) {
       Serial.print(F("Lectura DHT lenta: "));
@@ -663,11 +441,17 @@ void leerSensor() {
       Serial.println(F(" ms"));
     }
   } else {
+    erroresSensor++;
     Serial.print(F("ERROR DHT ("));
     Serial.print(status);
     Serial.print(F("), duracion "));
     Serial.print(duracion);
     Serial.println(F(" ms"));
+  }
+  if (erroresSensor >= MAX_ERRORES_SENSOR && sensorValido) {
+    sensorValido = false;
+    Serial.println(F("ALERTA: sensor fallando. Apagando calefactor/humificador."));
+    apagarActuadoresSeguro();
   }
 }
 
@@ -678,12 +462,11 @@ unsigned long calcularTiempoVolteo() {
     tv = obtenerUptimeTotal();
   }
   unsigned long elapsed = obtenerUptimeTotal() - tv;
-  if (elapsed >= perfilActivo.intervalo_volteo_ms) return 0;
-  return (perfilActivo.intervalo_volteo_ms - elapsed) / 1000UL;
+  if (elapsed >= intervaloVolteoMs) return 0;
+  return (intervaloVolteoMs - elapsed) / 1000UL;
 }
 
-// ===================== COMANDOS COMPARTIDOS (SERIAL + BOT) =====================
-
+// ===================== COMANDOS COMPARTIDOS =====================
 void subirTemp() {
   tempObjetivo += 0.5;
   Serial.print(F("Temp objetivo: "));
@@ -729,12 +512,10 @@ void forzarVolteoManual() {
 
 void mostrarInfoSerial() {
   Serial.println(F("--- INFO INCUBADORA ---"));
-  Serial.print(F("Perfil: "));
-  Serial.println(perfilActivo.nombre);
   Serial.print(F("Dia: "));
   Serial.print(diaActual);
   Serial.print(F("/"));
-  Serial.println(perfilActivo.dias_total);
+  Serial.println(diasTotal);
   Serial.print(F("Fase: "));
   Serial.println(enLockdown ? "LOCKDOWN (eclosion)" : "DESARROLLO");
   Serial.print(F("Temp: "));
@@ -758,325 +539,82 @@ void mostrarInfoSerial() {
   Serial.print(F("Uptime: "));
   Serial.print(obtenerUptimeTotal() / 3600000UL);
   Serial.println(F(" horas"));
-  Serial.print(F("Proteccion flash: ACTIVA"));
-  Serial.println();
   Serial.print(F("WiFi: "));
   Serial.println(WiFi.status() == WL_CONNECTED ? "CONECTADO" : "DESCONECTADO");
   Serial.print(F("Bot: "));
   Serial.println(botListo ? "ACTIVO" : "INACTIVO");
+  Serial.print(F("Heap libre: "));
+  Serial.println(ESP.getFreeHeap());
 }
 
 String obtenerInfoTelegram() {
   char buf[512];
   unsigned long uptimeH = obtenerUptimeTotal() / 3600000UL;
-  if (!enLockdown) {
-    unsigned long rest = calcularTiempoVolteo();
-    snprintf(buf, sizeof(buf),
-      "INCUBADORA AUTOMATICA\n"
-      "Perfil: %s\n"
-      "Dia: %d/%d\n"
-      "Fase: %s\n"
-      "Temp: %.1fC (obj %.1fC)\n"
-      "Hum: %.1f%% (obj %.0f-%.0f%%)\n"
-      "Calefactor: %s\n"
-      "Humificador: %s\n"
-      "Motor: %s\n"
-      "Prox. volteo: %luh %lum\n"
-      "Uptime: %luh",
-      perfilActivo.nombre,
-      diaActual, perfilActivo.dias_total,
-      enLockdown ? "LOCKDOWN (eclosion)" : "DESARROLLO",
-      temperatura, tempObjetivo,
-      humedad, obtenerHumMin(), obtenerHumMax(),
-      estadoCalefactor ? "ON" : "OFF",
-      estadoHumificador ? "ON" : "OFF",
-      motorVolteando ? "GIRANDO" : "OFF",
-      rest / 3600, (rest % 3600) / 60,
-      uptimeH);
-  } else {
-    snprintf(buf, sizeof(buf),
-      "INCUBADORA AUTOMATICA\n"
-      "Perfil: %s\n"
-      "Dia: %d/%d\n"
-      "Fase: %s\n"
-      "Temp: %.1fC (obj %.1fC)\n"
-      "Hum: %.1f%% (obj %.0f-%.0f%%)\n"
-      "Calefactor: %s\n"
-      "Humificador: %s\n"
-      "Motor: %s\n"
-      "Uptime: %luh",
-      perfilActivo.nombre,
-      diaActual, perfilActivo.dias_total,
-      enLockdown ? "LOCKDOWN (eclosion)" : "DESARROLLO",
-      temperatura, tempObjetivo,
-      humedad, obtenerHumMin(), obtenerHumMax(),
-      estadoCalefactor ? "ON" : "OFF",
-      estadoHumificador ? "ON" : "OFF",
-      motorVolteando ? "GIRANDO" : "OFF",
-      uptimeH);
-  }
+  unsigned long rest = calcularTiempoVolteo();
+  snprintf(buf, sizeof(buf),
+    "INCUBADORA\n"
+    "Dia: %d/%d\n"
+    "Fase: %s\n"
+    "Temp: %.1fC (obj %.1fC)\n"
+    "Hum: %.1f%% (obj %.0f-%.0f%%)\n"
+    "Calefactor: %s\n"
+    "Humificador: %s\n"
+    "Motor: %s\n"
+    "Prox. volteo: %luh %lum\n"
+    "Uptime: %luh",
+    diaActual, diasTotal,
+    enLockdown ? "LOCKDOWN" : "DESARROLLO",
+    temperatura, tempObjetivo,
+    humedad, obtenerHumMin(), obtenerHumMax(),
+    estadoCalefactor ? "ON" : "OFF",
+    estadoHumificador ? "ON" : "OFF",
+    motorVolteando ? "GIRANDO" : "OFF",
+    rest / 3600, (rest % 3600) / 60,
+    uptimeH);
   return String(buf);
 }
 
 String obtenerAyudaTelegram() {
   String s;
-  s += "COMANDOS DEL BOT:\n";
-  s += "info         - estado completo\n";
-  s += "+ / -        - subir/bajar temp\n";
-  s += "temp 38.0    - fijar temp objetivo\n";
-  s += "h            - toggle humificador\n";
-  s += "c            - toggle calefactor\n";
-  s += "t            - volteo forzado\n";
-  s += "s            - guardar estado\n";
-  s += "reset si     - borrar estado\n";
-  s += "wifi         - estado de la red\n";
-  s += "ota <url>    - actualizar firmware\n";
-  s += "id           - tu chat_id";
+  s += "COMANDOS:\n";
+  s += "info - estado completo\n";
+  s += "help - esta ayuda\n";
+  s += "id - tu chat_id";
   return s;
 }
 
 void mostrarAyudaSerial() {
   Serial.println(F("--- COMANDOS ---"));
-  Serial.println(F("+/-           subir/bajar temp"));
+  Serial.println(F("+/-           subir/bajar temp objetivo"));
   Serial.println(F("temp 38.0     fijar temp objetivo"));
-  Serial.println(F("h             toggle humificador"));
-  Serial.println(F("c             toggle calefactor"));
+  Serial.println(F("h             toggle humificador manual"));
+  Serial.println(F("c             toggle calefactor manual"));
   Serial.println(F("t             volteo forzado"));
   Serial.println(F("s             guardar estado"));
   Serial.println(F("r             reset estado"));
   Serial.println(F("d / info      mostrar info"));
-  Serial.println(F("wifi          estado de red"));
-  Serial.println(F("wifi s c      guardar y conectar (ej: wifi JOCAMER clave)"));
-  Serial.println(F("token T       guardar token de Telegram (tambien t=<token>)"));
-  Serial.println(F("delwifi       borrar credenciales WiFi"));
-  Serial.println(F("deltoken      borrar token del bot"));
-  Serial.println(F("allow <id>    permitir chat de Telegram"));
-  Serial.println(F("block <id>    bloquear chat de Telegram"));
-  Serial.println(F("ota <url>     actualizar firmware (OTA)"));
-}
-
-// ===================== WEB SERVER DASHBOARD =====================
-
-void handleRoot() {
-  server.send_P(200, "text/html", DASHBOARD_HTML);
-}
-
-void handleStatus() {
-  char json[768];
-  snprintf(json, sizeof(json),
-    "{"
-    "\"temp\":%.1f,"
-    "\"hum\":%.1f,"
-    "\"temp_obj\":%.1f,"
-    "\"temp_min\":%.1f,"
-    "\"temp_max\":%.1f,"
-    "\"hum_min\":%.1f,"
-    "\"hum_max\":%.1f,"
-    "\"cal\":%s,"
-    "\"humidor\":%s,"
-    "\"motor\":%s,"
-    "\"dia\":%d,"
-    "\"dias_total\":%d,"
-    "\"dia_lockdown\":%d,"
-    "\"fase\":\"%s\","
-    "\"lockdown\":%s,"
-    "\"volteo_restante\":%lu,"
-    "\"perfil\":\"%s\","
-    "\"perfil_id\":%d,"
-    "\"wifi\":%s,"
-    "\"ip\":\"%s\","
-    "\"bot\":%s,"
-    "\"modo_ap\":%s,"
-    "\"uptime\":%lu"
-    "}",
-    temperatura, humedad, tempObjetivo, tempMin, tempMax,
-    obtenerHumMin(), obtenerHumMax(),
-    estadoCalefactor ? "true" : "false",
-    estadoHumificador ? "true" : "false",
-    motorVolteando ? "true" : "false",
-    diaActual, perfilActivo.dias_total, perfilActivo.dia_lockdown,
-    enLockdown ? "LOCKDOWN" : "DESARROLLO",
-    enLockdown ? "true" : "false",
-    calcularTiempoVolteo(),
-    perfilActivo.nombre,
-    perfilIdActivo,
-    WiFi.status() == WL_CONNECTED ? "true" : "false",
-    WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : (modoAP ? "192.168.4.1" : ""),
-    botListo ? "true" : "false",
-    modoAP ? "true" : "false",
-    obtenerUptimeTotal() / 1000UL);
-  server.send(200, "application/json", json);
-}
-
-void handleControl() {
-  String action = server.arg("action");
-  String value = server.arg("value");
-  action.toLowerCase();
-
-  if (action == "cal") {
-    webCmdCal = true;
-  } else if (action == "hum") {
-    webCmdHum = true;
-  } else if (action == "vol") {
-    webCmdVol = true;
-  } else if (action == "temp_up") {
-    webCmdTempUp = true;
-  } else if (action == "temp_down") {
-    webCmdTempDown = true;
-  } else if (action == "temp_set") {
-    webCmdTempSet = value.toFloat();
-  } else if (action == "profile") {
-    webCmdProfileId = value.toInt();
-  } else if (action == "custom") {
-    webCmdCustom = true;
-    webCmdCustomParams[0] = server.arg("dias_total").toFloat();
-    webCmdCustomParams[1] = server.arg("dia_lockdown").toFloat();
-    webCmdCustomParams[2] = server.arg("temp_obj").toFloat();
-    webCmdCustomParams[3] = server.arg("temp_min").toFloat();
-    webCmdCustomParams[4] = server.arg("temp_max").toFloat();
-    webCmdCustomParams[5] = server.arg("hum_min_dev").toFloat();
-    webCmdCustomParams[6] = server.arg("hum_max_dev").toFloat();
-    webCmdCustomParams[7] = server.arg("hum_min_lock").toFloat();
-    webCmdCustomParams[8] = server.arg("hum_max_lock").toFloat();
-    webCmdCustomParams[9] = server.arg("intervalo_volteo_h").toFloat();
-  } else if (action == "save") {
-    webCmdSave = true;
-  }
-
-  server.send(200, "application/json", "{\"ok\":true}");
-}
-
-void handleProfiles() {
-  String json = "[";
-  for (int i = 0; i < NUM_PERFILES; i++) {
-    if (i > 0) json += ",";
-    json += "{\"id\":" + String(i) + ",\"nombre\":\"" + String(PERFILES[i].nombre) + "\"}";
-  }
-  json += "]";
-  server.send(200, "application/json", json);
-}
-
-void handleConfig() {
-  String ssid = server.arg("ssid");
-  String pass = server.arg("pass");
-  String token = server.arg("token");
-  String chats = server.arg("chats");
-
-  if (ssid.length() > 0) {
-    wifiSsid = ssid;
-    wifiPass = pass;
-  }
-  if (token.length() > 0) {
-    telegramToken = token;
-    telegramToken.trim();
-  }
-  if (chats.length() > 0) {
-    chatsPermitidos = chats;
-  }
-
-  guardarRed();
-
-  if (ssid.length() > 0) {
-    server.send(200, "application/json", "{\"ok\":true,\"msg\":\"WiFi guardado. Reiniciando...\"}");
-    delay(500);
-    ESP.restart();
-  } else {
-    server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Configuracion guardada.\"}");
-  }
-}
-
-void setupWebServer() {
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/api/status", HTTP_GET, handleStatus);
-  server.on("/api/control", HTTP_GET, handleControl);
-  server.on("/api/profiles", HTTP_GET, handleProfiles);
-  server.on("/api/config", HTTP_POST, handleConfig);
-  server.onNotFound(handleRoot); // Captive portal: cualquier ruta sirve el dashboard
-  server.begin();
-  Serial.println(F("Servidor web iniciado en puerto 80."));
-}
-
-void aplicarPerfil(int id) {
-  if (id < 0 || id >= NUM_PERFILES) return;
-  perfilIdActivo = id;
-  perfilActivo = PERFILES[id];
-  tempObjetivo = perfilActivo.temp_objetivo;
-  tempMin = perfilActivo.temp_min;
-  tempMax = perfilActivo.temp_max;
-  Serial.print(F("Perfil activo: "));
-  Serial.println(perfilActivo.nombre);
-  guardarEstado();
-}
-
-void aplicarCustomParams() {
-  perfilIdActivo = NUM_PERFILES - 1; // Personalizado
-  perfilActivo = PERFILES[perfilIdActivo];
-  perfilActivo.dias_total = (int)webCmdCustomParams[0];
-  perfilActivo.dia_lockdown = (int)webCmdCustomParams[1];
-  perfilActivo.temp_objetivo = webCmdCustomParams[2];
-  perfilActivo.temp_min = webCmdCustomParams[3];
-  perfilActivo.temp_max = webCmdCustomParams[4];
-  perfilActivo.hum_min_desarrollo = webCmdCustomParams[5];
-  perfilActivo.hum_max_desarrollo = webCmdCustomParams[6];
-  perfilActivo.hum_min_lockdown = webCmdCustomParams[7];
-  perfilActivo.hum_max_lockdown = webCmdCustomParams[8];
-  float horas = webCmdCustomParams[9];
-  if (horas > 0) {
-    perfilActivo.intervalo_volteo_ms = (unsigned long)(horas * 3600UL * 1000UL);
-  }
-  tempObjetivo = perfilActivo.temp_objetivo;
-  tempMin = perfilActivo.temp_min;
-  tempMax = perfilActivo.temp_max;
-  Serial.println(F("Perfil personalizado aplicado."));
-  guardarEstado();
-}
-
-void processWebCommands() {
-  if (webCmdCal) {
-    toggleCalManual();
-    webCmdCal = false;
-  }
-  if (webCmdHum) {
-    toggleHumManual();
-    webCmdHum = false;
-  }
-  if (webCmdVol) {
-    forzarVolteoManual();
-    webCmdVol = false;
-  }
-  if (webCmdTempUp) {
-    subirTemp();
-    webCmdTempUp = false;
-  }
-  if (webCmdTempDown) {
-    bajarTemp();
-    webCmdTempDown = false;
-  }
-  if (webCmdTempSet > 0.0) {
-    tempObjetivo = webCmdTempSet;
-    Serial.print(F("Temp objetivo (web): "));
-    Serial.print(tempObjetivo, 1);
-    Serial.println(F(" C"));
-    webCmdTempSet = 0.0;
-  }
-  if (webCmdProfileId >= 0) {
-    aplicarPerfil(webCmdProfileId);
-    webCmdProfileId = -1;
-  }
-  if (webCmdCustom) {
-    aplicarCustomParams();
-    webCmdCustom = false;
-    for (int i = 0; i < 10; i++) webCmdCustomParams[i] = 0;
-  }
-  if (webCmdSave) {
-    guardarEstado();
-    webCmdSave = false;
-  }
+  Serial.println(F("set dias X    dias totales incubacion"));
+  Serial.println(F("set lock X    dia inicio lockdown"));
+  Serial.println(F("set tobj X    temp objetivo"));
+  Serial.println(F("set tmin X    temp minima"));
+  Serial.println(F("set tmax X    temp maxima"));
+  Serial.println(F("set hmin X    hum min desarrollo"));
+  Serial.println(F("set hmax X    hum max desarrollo"));
+  Serial.println(F("set hlmin X   hum min lockdown"));
+  Serial.println(F("set hlmax X   hum max lockdown"));
+  Serial.println(F("set vol X     intervalo volteo (horas)"));
+  Serial.println(F("set dur X     duracion volteo (segundos)"));
+  Serial.println(F("params        mostrar parametros"));
+  Serial.println(F("wifi ssid pass"));
+  Serial.println(F("token TOKEN"));
+  Serial.println(F("allow/block ID"));
+  Serial.println(F("delwifi / deltoken"));
+  Serial.println(F("help          esta ayuda"));
 }
 
 // ===================== BOT TELEGRAM =====================
-
 void notificarTodos(const String& msg) {
+  if (!botListo) return;
   String resto = chatsPermitidos;
   while (resto.length() > 0) {
     int coma = resto.indexOf(',');
@@ -1084,7 +622,7 @@ void notificarTodos(const String& msg) {
     id.trim();
     if (id.length() > 0) {
       bot.sendMessage(id, msg, "");
-      yield();
+      delay(10);
     }
     if (coma >= 0) resto = resto.substring(coma + 1);
     else break;
@@ -1093,102 +631,41 @@ void notificarTodos(const String& msg) {
 
 void manejarMensajes(int num) {
   for (int i = 0; i < num; i++) {
-    yield();
     String chat = bot.messages[i].chat_id;
     if (chat.length() == 0) continue;
-
     String texto = bot.messages[i].text;
     texto.trim();
     String textoLow = texto;
     textoLow.toLowerCase();
     if (textoLow.startsWith("/")) textoLow = textoLow.substring(1);
-
     int sp = textoLow.indexOf(' ');
     String cmd = textoLow;
-    String arg = "";
-    if (sp >= 0) {
-      cmd = textoLow.substring(0, sp);
-      arg = texto.substring(sp + 1);
-      arg.trim();
-    }
-
+    if (sp >= 0) cmd = textoLow.substring(0, sp);
     if (cmd.length() == 0) continue;
 
     if (cmd == "start") {
       if (chatsPermitidos.length() == 0) agregarChat(chat);
       if (chatPermitido(chat)) {
-        bot.sendMessage(chat, "Hola! Soy el bot de la incubadora.\n\n" + obtenerAyudaTelegram(), "");
+        bot.sendMessage(chat, "Hola! Bot de incubadora.\n\n" + obtenerAyudaTelegram(), "");
       } else {
-        bot.sendMessage(chat, "No autorizado. Pide acceso por serial: allow " + chat, "");
+        bot.sendMessage(chat, "No autorizado. Pide acceso: allow " + chat, "");
       }
       continue;
     }
-
     if (cmd == "id") {
       bot.sendMessage(chat, "Tu chat_id: " + chat, "");
       continue;
     }
-
     if (cmd == "help" || cmd == "ayuda") {
       bot.sendMessage(chat, obtenerAyudaTelegram(), "");
       continue;
     }
-
     if (!chatPermitido(chat)) {
       bot.sendMessage(chat, "No autorizado.", "");
       continue;
     }
-
     if (cmd == "info" || cmd == "estado" || cmd == "status") {
       bot.sendMessage(chat, obtenerInfoTelegram(), "");
-    } else if (cmd == "+" || cmd == "subir") {
-      subirTemp();
-      bot.sendMessage(chat, "Temp objetivo: " + String(tempObjetivo, 1) + "C", "");
-    } else if (cmd == "-" || cmd == "bajar") {
-      bajarTemp();
-      bot.sendMessage(chat, "Temp objetivo: " + String(tempObjetivo, 1) + "C", "");
-    } else if (cmd == "temp") {
-      float v = arg.toFloat();
-      if (v > 0) {
-        tempObjetivo = v;
-        bot.sendMessage(chat, "Temp objetivo: " + String(tempObjetivo, 1) + "C", "");
-      } else {
-        bot.sendMessage(chat, "Uso: temp 38.0", "");
-      }
-    } else if (cmd == "h" || cmd == "hum" || cmd == "humificador") {
-      toggleHumManual();
-      bot.sendMessage(chat, "Humificador manual: " + String(manualHum ? "ON" : "OFF"), "");
-    } else if (cmd == "c" || cmd == "cal" || cmd == "calefactor") {
-      toggleCalManual();
-      bot.sendMessage(chat, "Calefactor manual: " + String(manualCal ? "ON" : "OFF"), "");
-    } else if (cmd == "t" || cmd == "vol" || cmd == "volteo") {
-      if (enLockdown) {
-        bot.sendMessage(chat, "Volteo bloqueado en LOCKDOWN.", "");
-      } else {
-        forzarVolteoManual();
-        bot.sendMessage(chat, "Volteo iniciado.", "");
-      }
-    } else if (cmd == "s" || cmd == "save" || cmd == "guardar") {
-      guardarEstado();
-      bot.sendMessage(chat, "Estado guardado.", "");
-    } else if (cmd == "reset" || cmd == "r") {
-      String argLow = arg;
-      argLow.toLowerCase();
-      if (argLow == "si" || argLow == "yes") {
-        borrarEstado();
-        bot.sendMessage(chat, "Estado borrado. Reiniciando.", "");
-      } else {
-        bot.sendMessage(chat, "Para resetear el estado escribe: reset si", "");
-      }
-    } else if (cmd == "wifi") {
-      bot.sendMessage(chat, "WiFi: " + String(WiFi.status() == WL_CONNECTED ? "conectado" : "desconectado") + " - IP " + WiFi.localIP().toString(), "");
-    } else if (cmd == "ota" || cmd == "update") {
-      if (arg.length() == 0) {
-        bot.sendMessage(chat, "Uso: ota <url_del_bin>", "");
-      } else {
-        bot.sendMessage(chat, "Descargando e instalando... el equipo reiniciara.", "");
-        hacerOTA(arg, chat);
-      }
     } else {
       bot.sendMessage(chat, "Comando desconocido. Usa: help", "");
     }
@@ -1197,408 +674,46 @@ void manejarMensajes(int num) {
 
 void procesarTelegram() {
   if (!botListo) return;
-
+  if (millis() - ultimoBot < INTERVALO_BOT) return;
+  ultimoBot = millis();
   if (!comandosRegistrados) {
-    String cmds = "[{\"command\":\"start\",\"description\":\"Bienvenida\"},{\"command\":\"help\",\"description\":\"Ayuda\"},{\"command\":\"info\",\"description\":\"Estado completo\"},{\"command\":\"temp\",\"description\":\"Fijar temp ej: temp 38\"},{\"command\":\"hum\",\"description\":\"Toggle humificador\"},{\"command\":\"cal\",\"description\":\"Toggle calefactor\"},{\"command\":\"volteo\",\"description\":\"Volteo forzado\"},{\"command\":\"guardar\",\"description\":\"Guardar estado\"},{\"command\":\"ota\",\"description\":\"Actualizar firmware (URL del bin)\"},{\"command\":\"reset\",\"description\":\"Reset estado\"}]";
-    if (bot.setMyCommands(cmds)) {
-      Serial.println(F("Comandos del bot registrados."));
-    }
+    String cmds = "[{\"command\":\"start\",\"description\":\"Bienvenida\"},{\"command\":\"help\",\"description\":\"Ayuda\"},{\"command\":\"info\",\"description\":\"Estado completo\"}]";
+    bot.setMyCommands(cmds);
     comandosRegistrados = true;
-    yield();
   }
-
-  // Solo un lote de updates por ciclo para no bloquear el loop
   int num = bot.getUpdates(bot.last_message_received + 1);
   if (num > 0) {
     manejarMensajes(num);
-    yield();
   }
 }
 
 void verificarAlertas() {
-  if (!botListo) return;
-  if (temperatura <= 0.0) return;
-
+  if (!botListo || temperatura <= 0.0 || !sensorValido) return;
   bool fuera = (temperatura < tempMin || temperatura > tempMax);
   if (fuera && !alarmaTemp) {
     alarmaTemp = true;
     notificarTodos("ALERTA: temperatura fuera de rango: " + String(temperatura, 1) + "C");
   } else if (!fuera && alarmaTemp) {
     alarmaTemp = false;
-    notificarTodos("OK: temperatura de nuevo en rango: " + String(temperatura, 1) + "C");
+    notificarTodos("OK: temperatura en rango: " + String(temperatura, 1) + "C");
   }
-}
-
-// ===================== TAREA TELEGRAM (CORE 0) =====================
-
-void actualizarSnapshot() {
-  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    snap.temperatura = temperatura;
-    snap.humedad = humedad;
-    snap.tempObjetivo = tempObjetivo;
-    snap.tempMin = tempMin;
-    snap.tempMax = tempMax;
-    snap.humMin = obtenerHumMin();
-    snap.humMax = obtenerHumMax();
-    snap.estadoCalefactor = estadoCalefactor;
-    snap.estadoHumificador = estadoHumificador;
-    snap.motorVolteando = motorVolteando;
-    snap.enLockdown = enLockdown;
-    snap.diaActual = diaActual;
-    snap.perfilDiasTotal = perfilActivo.dias_total;
-    snap.perfilIdActivo = perfilIdActivo;
-    snap.perfilNombre = perfilActivo.nombre;
-    snap.uptime = obtenerUptimeTotal();
-    snap.tiempoVolteoRestante = calcularTiempoVolteo();
-    xSemaphoreGive(stateMutex);
-  }
-}
-
-void enviarComando(TelegramCmdType cmd, float value = 0) {
-  TelegramCmdMsg msg = { cmd, value };
-  xQueueSend(telegramCmdQueue, &msg, pdMS_TO_TICKS(100));
-}
-
-String obtenerInfoSnapshot() {
-  char buf[512];
-  StateSnapshot s;
-  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    s = snap;
-    xSemaphoreGive(stateMutex);
-  } else {
-    return "Error: no se pudo leer estado.";
-  }
-  unsigned long uptimeH = s.uptime / 3600000UL;
-  if (!s.enLockdown) {
-    unsigned long rest = s.tiempoVolteoRestante;
-    snprintf(buf, sizeof(buf),
-      "INCUBADORA AUTOMATICA\n"
-      "Perfil: %s\n"
-      "Dia: %d/%d\n"
-      "Fase: %s\n"
-      "Temp: %.1fC (obj %.1fC)\n"
-      "Hum: %.1f%% (obj %.0f-%.0f%%)\n"
-      "Calefactor: %s\n"
-      "Humificador: %s\n"
-      "Motor: %s\n"
-      "Prox. volteo: %luh %lum\n"
-      "Uptime: %luh",
-      s.perfilNombre,
-      s.diaActual, s.perfilDiasTotal,
-      s.enLockdown ? "LOCKDOWN (eclosion)" : "DESARROLLO",
-      s.temperatura, s.tempObjetivo,
-      s.humedad, s.humMin, s.humMax,
-      s.estadoCalefactor ? "ON" : "OFF",
-      s.estadoHumificador ? "ON" : "OFF",
-      s.motorVolteando ? "GIRANDO" : "OFF",
-      rest / 3600, (rest % 3600) / 60,
-      uptimeH);
-  } else {
-    snprintf(buf, sizeof(buf),
-      "INCUBADORA AUTOMATICA\n"
-      "Perfil: %s\n"
-      "Dia: %d/%d\n"
-      "Fase: %s\n"
-      "Temp: %.1fC (obj %.1fC)\n"
-      "Hum: %.1f%% (obj %.0f-%.0f%%)\n"
-      "Calefactor: %s\n"
-      "Humificador: %s\n"
-      "Motor: %s\n"
-      "Uptime: %luh",
-      s.perfilNombre,
-      s.diaActual, s.perfilDiasTotal,
-      s.enLockdown ? "LOCKDOWN (eclosion)" : "DESARROLLO",
-      s.temperatura, s.tempObjetivo,
-      s.humedad, s.humMin, s.humMax,
-      s.estadoCalefactor ? "ON" : "OFF",
-      s.estadoHumificador ? "ON" : "OFF",
-      s.motorVolteando ? "GIRANDO" : "OFF",
-      uptimeH);
-  }
-  return String(buf);
-}
-
-void manejarMensajesTelegram(int num) {
-  StateSnapshot s;
-  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    s = snap;
-    xSemaphoreGive(stateMutex);
-  }
-
-  for (int i = 0; i < num; i++) {
-    String chat = bot.messages[i].chat_id;
-    if (chat.length() == 0) continue;
-
-    String texto = bot.messages[i].text;
-    texto.trim();
-    String textoLow = texto;
-    textoLow.toLowerCase();
-    if (textoLow.startsWith("/")) textoLow = textoLow.substring(1);
-
-    int sp = textoLow.indexOf(' ');
-    String cmd = textoLow;
-    String arg = "";
-    if (sp >= 0) {
-      cmd = textoLow.substring(0, sp);
-      arg = texto.substring(sp + 1);
-      arg.trim();
-    }
-
-    if (cmd.length() == 0) continue;
-
-    if (cmd == "start") {
-      if (chatsPermitidos.length() == 0) {
-        agregarChat(chat);
-        chatsPermitidos = chat;
-      }
-      if (chatPermitido(chat)) {
-        bot.sendMessage(chat, "Hola! Soy el bot de la incubadora.\n\n" + obtenerAyudaTelegram(), "");
-      } else {
-        bot.sendMessage(chat, "No autorizado. Pide acceso por serial: allow " + chat, "");
-      }
-      continue;
-    }
-
-    if (cmd == "id") {
-      bot.sendMessage(chat, "Tu chat_id: " + chat, "");
-      continue;
-    }
-
-    if (cmd == "help" || cmd == "ayuda") {
-      bot.sendMessage(chat, obtenerAyudaTelegram(), "");
-      continue;
-    }
-
-    if (!chatPermitido(chat)) {
-      bot.sendMessage(chat, "No autorizado.", "");
-      continue;
-    }
-
-    if (cmd == "info" || cmd == "estado" || cmd == "status") {
-      bot.sendMessage(chat, obtenerInfoSnapshot(), "");
-    } else if (cmd == "+" || cmd == "subir") {
-      enviarComando(TCMD_SUBIR_TEMP);
-      bot.sendMessage(chat, "Temp objetivo subiendo...", "");
-    } else if (cmd == "-" || cmd == "bajar") {
-      enviarComando(TCMD_BAJAR_TEMP);
-      bot.sendMessage(chat, "Temp objetivo bajando...", "");
-    } else if (cmd == "temp") {
-      float v = arg.toFloat();
-      if (v > 0) {
-        enviarComando(TCMD_SET_TEMP, v);
-        bot.sendMessage(chat, "Temp objetivo: " + String(v, 1) + "C", "");
-      } else {
-        bot.sendMessage(chat, "Uso: temp 38.0", "");
-      }
-    } else if (cmd == "h" || cmd == "hum" || cmd == "humificador") {
-      enviarComando(TCMD_TOGGLE_HUM);
-      bot.sendMessage(chat, "Humificador toggled.", "");
-    } else if (cmd == "c" || cmd == "cal" || cmd == "calefactor") {
-      enviarComando(TCMD_TOGGLE_CAL);
-      bot.sendMessage(chat, "Calefactor toggled.", "");
-    } else if (cmd == "t" || cmd == "vol" || cmd == "volteo") {
-      if (s.enLockdown) {
-        bot.sendMessage(chat, "Volteo bloqueado en LOCKDOWN.", "");
-      } else {
-        enviarComando(TCMD_FORZAR_VOLTEO);
-        bot.sendMessage(chat, "Volteo iniciado.", "");
-      }
-    } else if (cmd == "s" || cmd == "save" || cmd == "guardar") {
-      enviarComando(TCMD_SAVE);
-      bot.sendMessage(chat, "Estado guardado.", "");
-    } else if (cmd == "reset" || cmd == "r") {
-      String argLow = arg;
-      argLow.toLowerCase();
-      if (argLow == "si" || argLow == "yes") {
-        enviarComando(TCMD_RESET);
-        bot.sendMessage(chat, "Estado borrado. Reiniciando.", "");
-      } else {
-        bot.sendMessage(chat, "Para resetear el estado escribe: reset si", "");
-      }
-    } else if (cmd == "wifi") {
-      bot.sendMessage(chat, "WiFi: " + String(WiFi.status() == WL_CONNECTED ? "conectado" : "desconectado") + " - IP " + WiFi.localIP().toString(), "");
-    } else if (cmd == "ota" || cmd == "update") {
-      if (arg.length() == 0) {
-        bot.sendMessage(chat, "Uso: ota <url_del_bin>", "");
-      } else {
-        bot.sendMessage(chat, "Descargando e instalando... el equipo reiniciara.", "");
-        hacerOTA(arg, chat);
-      }
-    } else {
-      bot.sendMessage(chat, "Comando desconocido. Usa: help", "");
-    }
-  }
-}
-
-void verificarAlertasTelegram() {
-  if (temperatura <= 0.0) return;
-
-  bool fuera = (temperatura < tempMin || temperatura > tempMax);
-  if (fuera && !alarmaTemp) {
-    alarmaTemp = true;
-    notificarTodos("ALERTA: temperatura fuera de rango: " + String(temperatura, 1) + "C");
-  } else if (!fuera && alarmaTemp) {
-    alarmaTemp = false;
-    notificarTodos("OK: temperatura de nuevo en rango: " + String(temperatura, 1) + "C");
-  }
-}
-
-void telegramTask(void* parameter) {
-  Serial.println(F("Tarea Telegram iniciada en core 0."));
-
-  bool comandosReg = false;
-  unsigned long ultimoCheck = 0;
-
-  for (;;) {
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    // Actualizar snapshot periodicamente (cada 2s)
-    actualizarSnapshot();
-
-    // Verificar si Telegram esta listo
-    bool wifiOk = (WiFi.status() == WL_CONNECTED);
-    static bool ntpLocal = false;
-    if (wifiOk && !ntpLocal) {
-      time_t now = time(nullptr);
-      if (now > 24 * 3600) ntpLocal = true;
-    }
-    bool listo = wifiOk && ntpLocal && telegramToken.length() > 0;
-
-    if (!listo) {
-      vTaskDelay(pdMS_TO_TICKS(5000));
-      continue;
-    }
-
-    // Registrar comandos del bot una vez
-    if (!comandosReg) {
-      String cmds = "[{\"command\":\"start\",\"description\":\"Bienvenida\"},{\"command\":\"help\",\"description\":\"Ayuda\"},{\"command\":\"info\",\"description\":\"Estado completo\"},{\"command\":\"temp\",\"description\":\"Fijar temp ej: temp 38\"},{\"command\":\"hum\",\"description\":\"Toggle humificador\"},{\"command\":\"cal\",\"description\":\"Toggle calefactor\"},{\"command\":\"volteo\",\"description\":\"Volteo forzado\"},{\"command\":\"guardar\",\"description\":\"Guardar estado\"},{\"command\":\"ota\",\"description\":\"Actualizar firmware (URL del bin)\"},{\"command\":\"reset\",\"description\":\"Reset estado\"}]";
-      if (bot.setMyCommands(cmds)) {
-        Serial.println(F("Comandos del bot registrados."));
-      }
-      comandosReg = true;
-    }
-
-    // Obtener actualizaciones de Telegram (la llamada bloqueante ocurre aqui, en core 0)
-    int num = bot.getUpdates(bot.last_message_received + 1);
-    if (num > 0) {
-      manejarMensajesTelegram(num);
-    }
-
-    // Verificar alertas de temperatura
-    verificarAlertasTelegram();
-
-    // Verificar si hay notificacion de lockdown pendiente
-    if (notifyLockdown) {
-      notifyLockdown = false;
-      notificarTodos("LOCKDOWN - Dia 18+. Volteo detenido. Humedad objetivo 65-70%.");
-    }
-
-    // Esperar intervalo antes del proximo ciclo
-    vTaskDelay(pdMS_TO_TICKS(INTERVALO_BOT));
-  }
-}
-
-// ===================== OTA (ARDUINOOTA + TELEGRAM) =====================
-
-void otaResponder(const String& chat, const String& msg) {
-  Serial.println(msg);
-  if (chat.length() > 0) bot.sendMessage(chat, msg, "");
-}
-
-void hacerOTA(const String& url, const String& chat) {
-  if (WiFi.status() != WL_CONNECTED) {
-    otaResponder(chat, "Error: sin WiFi.");
-    return;
-  }
-
-  digitalWrite(PIN_RELAY_HEAT, HIGH);
-  digitalWrite(PIN_RELAY_HUM, HIGH);
-  digitalWrite(PIN_RELAY_MOTOR, HIGH);
-
-  WiFiClientSecure otaClient;
-  otaClient.setInsecure();
-  otaClient.setTimeout(10);
-
-  HTTPClient http;
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(10000);
-  http.begin(otaClient, url);
-
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    otaResponder(chat, "Error HTTP: " + String(code));
-    http.end();
-    return;
-  }
-
-  int len = http.getSize();
-  if (len <= 0) {
-    otaResponder(chat, "Tamaño del binario desconocido.");
-    http.end();
-    return;
-  }
-  if (!Update.begin(len)) {
-    otaResponder(chat, "No hay espacio para " + String(len) + " bytes.");
-    http.end();
-    return;
-  }
-
-  Stream &stream = http.getStream();
-  uint8_t buf[1024];
-  size_t total = 0;
-  unsigned long ultimoWdt = millis();
-  while (total < (size_t)len) {
-    size_t n = stream.readBytes(buf, sizeof(buf));
-    if (n == 0) {
-      otaResponder(chat, "Conexión cortada: " + String(total) + "/" + String(len) + " bytes.");
-      Update.abort();
-      http.end();
-      return;
-    }
-    if (Update.write(buf, n) != n) {
-      otaResponder(chat, "Fallo de escritura: " + String(Update.getError()));
-      Update.abort();
-      http.end();
-      return;
-    }
-    total += n;
-    if (millis() - ultimoWdt >= 1000) {
-      ultimoWdt = millis();
-    }
-    yield();
-  }
-
-  if (!Update.end(true)) {
-    otaResponder(chat, "Fallo final: " + String(Update.getError()));
-    http.end();
-    return;
-  }
-
-  http.end();
-  otaResponder(chat, "Actualizado. Reiniciando...");
-  delay(500);
-  ESP.restart();
 }
 
 // ===================== PANTALLA TFT =====================
-
 void dibujarPantalla() {
   if (!displayOk) return;
   gfx->fillScreen(COLOR_BLACK);
 
-  // ---- TITULO ----
   gfx->setCursor(15, 0);
   gfx->setTextColor(COLOR_YELLOW);
   gfx->setTextSize(3);
   gfx->println("INCUBADORA");
 
-  // Perfil activo
   gfx->setTextSize(1);
   gfx->setCursor(0, 24);
   gfx->setTextColor(COLOR_CYAN);
-  gfx->print(perfilActivo.nombre);
+  gfx->print("Personalizado");
 
-  // ---- TEMPERATURA ----
   gfx->setCursor(0, 32);
   gfx->setTextColor(COLOR_WHITE);
   gfx->setTextSize(2);
@@ -1613,7 +728,6 @@ void dibujarPantalla() {
   gfx->setCursor(0, 52);
   gfx->print(temperatura, 1);
 
-  // Estado calefactor al lado del valor
   gfx->setTextSize(2);
   gfx->setCursor(120, 60);
   if (estadoCalefactor) {
@@ -1624,7 +738,6 @@ void dibujarPantalla() {
     gfx->println("CAL OFF");
   }
 
-  // ---- HUMEDAD ----
   gfx->setCursor(0, 100);
   gfx->setTextColor(COLOR_WHITE);
   gfx->setTextSize(2);
@@ -1642,7 +755,6 @@ void dibujarPantalla() {
   gfx->print(humedad, 0);
   gfx->print("%");
 
-  // Estado humificador al lado
   gfx->setTextSize(2);
   gfx->setCursor(120, 128);
   if (estadoHumificador) {
@@ -1653,10 +765,8 @@ void dibujarPantalla() {
     gfx->println("HUM OFF");
   }
 
-  // ---- SEPARADOR ----
   gfx->drawFastHLine(0, 175, 170, COLOR_DKGREY);
 
-  // ---- VOLTEO / LOCKDOWN ----
   if (enLockdown) {
     gfx->setCursor(0, 185);
     gfx->setTextColor(COLOR_MAGENTA);
@@ -1667,7 +777,6 @@ void dibujarPantalla() {
     gfx->setTextColor(COLOR_WHITE);
     gfx->setTextSize(2);
     gfx->print("Volteo: ");
-
     if (motorVolteando) {
       gfx->setTextColor(COLOR_ORANGE);
       gfx->println("GIRANDO");
@@ -1683,14 +792,13 @@ void dibujarPantalla() {
     }
   }
 
-  // ---- DIA + FASE ----
   gfx->setCursor(0, 220);
   gfx->setTextColor(COLOR_WHITE);
   gfx->setTextSize(3);
   gfx->print("D");
   gfx->print(diaActual);
   gfx->print("/");
-  gfx->println(perfilActivo.dias_total);
+  gfx->println(diasTotal);
 
   gfx->setTextSize(2);
   gfx->setCursor(0, 248);
@@ -1702,23 +810,22 @@ void dibujarPantalla() {
     gfx->println("DESARROLLO");
   }
 
-  // ---- BARRA DE PROGRESO ----
   int barraAncho = 160;
-  int barraProgreso = (int)((float)diaActual / perfilActivo.dias_total * barraAncho);
+  int barraProgreso = (int)((float)diaActual / diasTotal * barraAncho);
   gfx->drawRect(5, 275, barraAncho, 14, COLOR_WHITE);
-  if (enLockdown) {
-    gfx->fillRect(6, 276, barraProgreso - 1, 12, COLOR_MAGENTA);
-  } else {
-    gfx->fillRect(6, 276, barraProgreso - 1, 12, COLOR_GREEN);
+  if (barraProgreso > 1) {
+    if (enLockdown) {
+      gfx->fillRect(6, 276, barraProgreso - 1, 12, COLOR_MAGENTA);
+    } else {
+      gfx->fillRect(6, 276, barraProgreso - 1, 12, COLOR_GREEN);
+    }
   }
 
-  // ---- PROTECCION ----
   gfx->setCursor(0, 295);
   gfx->setTextColor(COLOR_BLUE);
   gfx->setTextSize(1);
   gfx->println("Protegido contra cortes");
 
-  // ---- ESTADO RED / BOT ----
   gfx->setTextSize(1);
   if (WiFi.status() == WL_CONNECTED) {
     gfx->setCursor(140, 296);
@@ -1738,7 +845,7 @@ void dibujarPantalla() {
     gfx->setTextColor(COLOR_RED);
     gfx->print("t");
   }
-  // ---- COMANDOS ----
+
   gfx->setCursor(0, 308);
   gfx->setTextColor(COLOR_DKGREY);
   gfx->setTextSize(1);
@@ -1750,25 +857,81 @@ void dibujarPantalla() {
 }
 
 // ===================== SERIAL COMANDOS =====================
-
 String serialBuf = "";
 
 String quitarPrefijo(String t) {
   t.trim();
   String low = t;
   low.toLowerCase();
-  if (low.startsWith("token=")) return t.substring(7);
+  if (low.startsWith("token=")) return t.substring(6);
   if (low.startsWith("ssid=") || low.startsWith("pass=")) return t.substring(5);
   if (low.startsWith("t=")) return t.substring(2);
   if (low.startsWith("s=") || low.startsWith("p=")) return t.substring(2);
   return t;
 }
 
+void mostrarParametrosSerial() {
+  Serial.println(F("--- PARAMETROS ---"));
+  Serial.print(F("Dias totales: ")); Serial.println(diasTotal);
+  Serial.print(F("Dia lockdown: ")); Serial.println(diaLockdown);
+  Serial.print(F("Temp objetivo: ")); Serial.println(tempObjetivo, 1);
+  Serial.print(F("Temp min: ")); Serial.println(tempMin, 1);
+  Serial.print(F("Temp max: ")); Serial.println(tempMax, 1);
+  Serial.print(F("Hum min dev: ")); Serial.println(humMinDesarrollo, 1);
+  Serial.print(F("Hum max dev: ")); Serial.println(humMaxDesarrollo, 1);
+  Serial.print(F("Hum min lock: ")); Serial.println(humMinLockdown, 1);
+  Serial.print(F("Hum max lock: ")); Serial.println(humMaxLockdown, 1);
+  Serial.print(F("Intervalo volteo: ")); Serial.print(intervaloVolteoMs / 3600000.0, 1); Serial.println(F(" h"));
+  Serial.print(F("Duracion volteo: ")); Serial.print(duracionVolteoMs / 1000.0, 1); Serial.println(F(" s"));
+}
+
+void procesarSet(const String& param, const String& valor) {
+  float v = valor.toFloat();
+  if (param == "dias") {
+    diasTotal = (int)v;
+    Serial.print(F("Dias totales: ")); Serial.println(diasTotal);
+  } else if (param == "lock") {
+    diaLockdown = (int)v;
+    Serial.print(F("Dia lockdown: ")); Serial.println(diaLockdown);
+  } else if (param == "tobj") {
+    tempObjetivo = v;
+    Serial.print(F("Temp objetivo: ")); Serial.println(tempObjetivo, 1);
+  } else if (param == "tmin") {
+    tempMin = v;
+    Serial.print(F("Temp min: ")); Serial.println(tempMin, 1);
+  } else if (param == "tmax") {
+    tempMax = v;
+    Serial.print(F("Temp max: ")); Serial.println(tempMax, 1);
+  } else if (param == "hmin") {
+    humMinDesarrollo = v;
+    Serial.print(F("Hum min dev: ")); Serial.println(humMinDesarrollo, 1);
+  } else if (param == "hmax") {
+    humMaxDesarrollo = v;
+    Serial.print(F("Hum max dev: ")); Serial.println(humMaxDesarrollo, 1);
+  } else if (param == "hlmin") {
+    humMinLockdown = v;
+    Serial.print(F("Hum min lock: ")); Serial.println(humMinLockdown, 1);
+  } else if (param == "hlmax") {
+    humMaxLockdown = v;
+    Serial.print(F("Hum max lock: ")); Serial.println(humMaxLockdown, 1);
+  } else if (param == "vol") {
+    if (v > 0) {
+      intervaloVolteoMs = (unsigned long)(v * 3600.0 * 1000.0);
+      Serial.print(F("Intervalo volteo: ")); Serial.print(v, 1); Serial.println(F(" h"));
+    }
+  } else if (param == "dur") {
+    if (v > 0) {
+      duracionVolteoMs = (unsigned long)(v * 1000.0);
+      Serial.print(F("Duracion volteo: ")); Serial.print(v, 1); Serial.println(F(" s"));
+    }
+  } else {
+    Serial.println(F("Parametro desconocido."));
+  }
+}
+
 void procesarLinea(String linea) {
   linea.trim();
   if (linea.length() == 0) return;
-
-  // Comandos de una sola letra (compatibilidad)
   if (linea.length() == 1) {
     switch (linea[0]) {
       case '+': subirTemp(); return;
@@ -1781,7 +944,6 @@ void procesarLinea(String linea) {
       case 'd': mostrarInfoSerial(); return;
     }
   }
-
   int sp = linea.indexOf(' ');
   String cmd = sp >= 0 ? linea.substring(0, sp) : linea;
   String arg = sp >= 0 ? linea.substring(sp + 1) : "";
@@ -1797,11 +959,8 @@ void procesarLinea(String linea) {
       String ssid = quitarPrefijo(sp2 >= 0 ? arg.substring(0, sp2) : arg);
       String pass = quitarPrefijo(sp2 >= 0 ? arg.substring(sp2 + 1) : "");
       if (ssid.length() == 0) {
-        Serial.println(F("Uso: wifi <ssid> <clave>  o  wifi s=<ssid> p=<clave>"));
+        Serial.println(F("Uso: wifi <ssid> <clave>"));
       } else {
-        if (pass.length() == 0) {
-          Serial.println(F("Sin clave (red abierta)."));
-        }
         configurarWifi(ssid, pass);
       }
     }
@@ -1811,7 +970,7 @@ void procesarLinea(String linea) {
     } else {
       String tok = quitarPrefijo(arg);
       if (tok.length() < 10 || tok.indexOf(':') < 0) {
-        Serial.println(F("Token invalido. Revisa el token de @BotFather."));
+        Serial.println(F("Token invalido."));
       } else {
         configurarToken(tok);
       }
@@ -1829,7 +988,7 @@ void procesarLinea(String linea) {
     Serial.println(F("Token del bot borrado."));
   } else if (cmdLower == "allow") {
     if (arg.length() == 0) {
-      Serial.print(F("Chats permitidos: "));
+      Serial.print(F("Chats: "));
       Serial.println(chatsPermitidos.length() > 0 ? chatsPermitidos : "(ninguno)");
     } else {
       agregarChat(arg);
@@ -1854,13 +1013,17 @@ void procesarLinea(String linea) {
     } else {
       Serial.println(F("Uso: temp 38.0"));
     }
-  } else if (cmdLower == "ota") {
-    if (arg.length() == 0) {
-      Serial.println(F("Uso: ota <url_del_bin>"));
+  } else if (cmdLower == "set") {
+    int sp2 = arg.indexOf(' ');
+    if (sp2 >= 0) {
+      String param = arg.substring(0, sp2);
+      String valor = arg.substring(sp2 + 1);
+      procesarSet(param, valor);
     } else {
-      Serial.println(F("Descargando e instalando OTA..."));
-      hacerOTA(arg, "");
+      Serial.println(F("Uso: set <param> <valor>"));
     }
+  } else if (cmdLower == "params") {
+    mostrarParametrosSerial();
   } else {
     Serial.println(F("Comando desconocido. Usa: help"));
   }
@@ -1878,8 +1041,6 @@ void procesarSerial() {
       serialBuf += c;
     }
   }
-
-  // Comandos de una sola letra enviados sin salto de linea
   if (serialBuf.length() == 1) {
     char c = serialBuf[0];
     if (c == '+' || c == '-' || c == 'h' || c == 't' || c == 's' || c == 'r' || c == 'c' || c == 'd') {
@@ -1890,63 +1051,37 @@ void procesarSerial() {
 }
 
 // ===================== SETUP =====================
-
 void setup() {
-  // Relays OFF cuanto antes (antes de Serial/NVS: evita bobinas al boot)
   relaysInitSeguro();
   millisArranque = millis();
 
   Serial.begin(115200);
+  Serial.println(F("\n=== Incubadora Automatica - Minima Estable ==="));
+  Serial.println(F("Relays OFF (arranque seguro)."));
 
-  Serial.println(F("\n=== Incubadora Automatica v2.0 ==="));
-  Serial.println(F("Relays en OFF (arranque seguro)."));
-
-  // Proteccion contra crash-loop por NVS corrupto tras cortes de energia
-  {
-    Preferences bootCtrl;
-    bootCtrl.begin("boot_ctrl", false);
-    int bootCount = bootCtrl.getInt("count", 0) + 1;
-    bootCtrl.putInt("count", bootCount);
-    bootCtrl.end();
-
-    if (bootCount > 3) {
-      Serial.println(F("CRASH-LOOP detectado (>3 reinicios). Borrando NVS..."));
-      Preferences wipe;
-      wipe.begin("incubadora", false);
-      wipe.clear();
-      wipe.end();
-      bootCtrl.begin("boot_ctrl", false);
-      bootCtrl.putInt("count", 0);
-      bootCtrl.end();
-      Serial.println(F("NVS limpiado. Arrancando con valores por defecto."));
-    }
-  }
-
-  // Watchdog: Arduino ya inicializa el TWDT. Reconfigurar para cubrir ambos cores.
+  // Watchdog a 5 segundos
   esp_task_wdt_config_t twdt_config = {};
-  twdt_config.timeout_ms = 30000;
+  twdt_config.timeout_ms = 5000;
   twdt_config.idle_core_mask = (1 << portNUM_PROCESSORS) - 1;
   twdt_config.trigger_panic = true;
   esp_task_wdt_reconfigure(&twdt_config);
-  Serial.println(F("Watchdog reconfigurado (30s, ambos cores)."));
+  Serial.println(F("Watchdog 5s activo."));
 
-  // Pantalla con retry (max 2 intentos, no bloquea el sistema si falla)
+  // Pantalla con retry
   for (int intento = 0; intento < 2; intento++) {
     esp_task_wdt_reset();
     if (gfx->begin()) {
       displayOk = true;
       break;
     }
-    Serial.printf("Intento display %d fallido, reintentando...\n", intento + 1);
     delay(500);
   }
   if (displayOk) {
     Serial.println(F("Pantalla TFT OK"));
   } else {
-    Serial.println(F("ERROR: Pantalla TFT no detectada tras 2 intentos. Continuando sin display."));
+    Serial.println(F("ERROR: Pantalla no detectada. Continua sin display."));
   }
 
-  // Splash screen (solo si display disponible)
   if (displayOk) {
     gfx->fillScreen(COLOR_BLACK);
     gfx->setTextColor(COLOR_GREEN);
@@ -1955,29 +1090,20 @@ void setup() {
     gfx->println("AVICORD");
     gfx->setCursor(15, 80);
     gfx->setTextSize(2);
-    gfx->println("Incubadora v2.0");
+    gfx->println("Incubadora");
     gfx->setCursor(15, 110);
-    gfx->setTextSize(2);
     gfx->println("Iniciando...");
     delay(200);
   }
 
-  // Cargar estado persistente y config de red (antes del sensor para usar settings)
   cargarEstado();
   cargarRed();
-
-  // Calcular dia con uptime acumulado
   calcularDia();
   verificarFase();
 
-  // Sensor DHT22: init + warmup no-bloqueante
   am2302.begin();
   am2302.read();
-  esp_task_wdt_reset();
-  sensorWarmupCount = 1;
-  sensorCalentando = true;
 
-  // Inicializar timestamps
   ultimoVolteo = obtenerUptimeTotal();
   ultimaLectura = millis();
   ultimaPantalla = millis();
@@ -1985,13 +1111,11 @@ void setup() {
   ultimoBot = millis();
   millisEnUltimoGuardado = millis();
 
-  // Bot de Telegram
   bot.updateToken(telegramToken);
   secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
-  secured_client.setTimeout(3);          // timeout de socket reducido
-  bot.waitForResponse = 1500;            // ms de espera de respuesta Telegram
+  secured_client.setTimeout(2);
+  bot.waitForResponse = 1000;
 
-  // WiFi
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   if (wifiSsid.length() > 0) {
@@ -1999,94 +1123,34 @@ void setup() {
     Serial.println(wifiSsid);
     WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
     ultimoIntentoWifi = millis();
-    inicioIntentoWiFi = millis();
-    intentoWiFiInicial = true;
   } else {
-    Serial.println(F("Sin credenciales WiFi. Modo AP activo."));
-    iniciarModoAP();
+    Serial.println(F("Sin WiFi configurado. Funcionamiento local."));
   }
 
   if (telegramToken.length() == 0) {
-    Serial.println(F("Configura el token del bot: token <BOT_TOKEN>"));
-  }
-
-  // OTA
-  ArduinoOTA.setHostname("incubadora");
-  ArduinoOTA.onStart([]() {
-    digitalWrite(PIN_RELAY_HEAT, HIGH);
-    digitalWrite(PIN_RELAY_HUM, HIGH);
-    digitalWrite(PIN_RELAY_MOTOR, HIGH);
-    Serial.println(F("OTA iniciada..."));
-  });
-  ArduinoOTA.begin();
-  Serial.println(F("OTA listo (ArduinoOTA)."));
-
-  // Web Server Dashboard
-  setupWebServer();
-
-  // Crear mutex y cola de comandos para la tarea de Telegram
-  stateMutex = xSemaphoreCreateMutex();
-  telegramCmdQueue = xQueueCreate(16, sizeof(TelegramCmdMsg));
-
-  if (stateMutex && telegramCmdQueue) {
-    Serial.println(F("Sincronizacion inter-tareas OK."));
-  } else {
-    Serial.println(F("ERROR: No se pudo crear mutex/cola."));
-  }
-
-  // Copiar estado inicial al snapshot
-  actualizarSnapshot();
-
-  // Iniciar tarea de Telegram en core 0 (4096 bytes de stack)
-  BaseType_t result = xTaskCreatePinnedToCore(
-    telegramTask,       // funcion de la tarea
-    "TelegramTask",     // nombre
-    8192,               // stack size (Telegram HTTPS necesita espacio)
-    NULL,               // parametro
-    2,                  // prioridad (2 = superior a loop default 1)
-    &telegramTaskHandle,// handle
-    0                   // core 0
-  );
-
-  if (result == pdPASS) {
-    Serial.println(F("Tarea Telegram creada en core 0."));
-  } else {
-    Serial.println(F("ERROR: No se pudo crear tarea Telegram."));
+    Serial.println(F("Sin token Telegram. Configura: token <BOT_TOKEN>"));
   }
 
   Serial.print(F("Dia: "));
   Serial.print(diaActual);
   Serial.print(F("/"));
-  Serial.println(perfilActivo.dias_total);
+  Serial.println(diasTotal);
   Serial.print(F("Fase: "));
   Serial.println(enLockdown ? "LOCKDOWN" : "DESARROLLO");
   Serial.println(F("Incubadora lista."));
-  Serial.println(F("Cmd: +/-:temp temp X h:hum c:cal t:vol s:save d:info r:reset help"));
+  Serial.println(F("Escribe 'help' para ver comandos."));
 }
 
 // ===================== LOOP =====================
-
 void loop() {
   unsigned long ahora = millis();
+  esp_task_wdt_reset();
 
-  // Actualizar uptime acumulado
   uptimeAcumulado += (ahora - millisEnUltimoGuardado);
   millisEnUltimoGuardado = ahora;
 
-  // Limpiar contador de crash-loop tras 10s de uptime estable
-  static bool bootCtrlCleared = false;
-  if (!bootCtrlCleared && uptimeAcumulado > 10000UL) {
-    Preferences bootCtrl;
-    bootCtrl.begin("boot_ctrl", false);
-    bootCtrl.putInt("count", 0);
-    bootCtrl.end();
-    bootCtrlCleared = true;
-  }
-
-  // Gestionar WiFi
   gestionarWifi();
 
-  // Estado del bot: WiFi + hora NTP + token
   bool wifiOk = (WiFi.status() == WL_CONNECTED);
   if (wifiOk && !tiempoSincronizado) {
     time_t now = time(nullptr);
@@ -2097,17 +1161,6 @@ void loop() {
   }
   botListo = wifiOk && tiempoSincronizado && telegramToken.length() > 0;
 
-  // Completar warmup del sensor DHT22 en background (1 lectura por ciclo)
-  if (sensorCalentando && sensorWarmupCount < 5) {
-    am2302.read();
-    sensorWarmupCount++;
-    if (sensorWarmupCount >= 5) {
-      sensorCalentando = false;
-      Serial.println(F("Sensor DHT22 listo."));
-    }
-  }
-
-  // Leer sensor y calcular fase
   if (ahora - ultimaLectura >= INTERVALO_LECTURA) {
     leerSensor();
     calcularDia();
@@ -2115,61 +1168,35 @@ void loop() {
     ultimaLectura = ahora;
   }
 
-  // Actuadores solo tras estabilizar rail 5V (evita brown-out con puente JD-VCC)
   if (!actuadoresListos && sensorValido && (ahora - millisArranque >= DELAY_ACTUADORES_MS)) {
     actuadoresListos = true;
     Serial.println(F("Actuadores habilitados."));
   }
 
-  // Controlar actuadores (solo tras sensor valido + delay)
   controlarCalefactor();
   controlarHumificador();
   verificarVolteo(ahora);
 
-  // Seguridad motor: forzar apagado si lleva mas de 30s encendido
-  if (motorVolteando && (ahora - inicioVolteo > 30000UL)) {
-    Serial.println(F("ALERTA: Motor timeout 30s. Apagando forzado."));
+  if (motorVolteando && (ahora - inicioVolteo > MOTOR_TIMEOUT_MS)) {
+    Serial.println(F("ALERTA: Motor timeout. Apagando forzado."));
     detenerVolteo();
   }
 
-  // Guardar estado periodicamente
   if (ahora - ultimaGuardado >= INTERVALO_GUARDADO) {
     guardarEstado();
     ultimaGuardado = ahora;
   }
 
-  // Actualizar pantalla
   if (ahora - ultimaPantalla >= INTERVALO_PANTALLA) {
     dibujarPantalla();
     ultimaPantalla = ahora;
   }
 
-  // Telegram ahora corre en tarea separada (core 0).
-  // Aqui solo procesamos comandos recibidos desde el bot.
-  TelegramCmdMsg tCmd;
-  while (xQueueReceive(telegramCmdQueue, &tCmd, 0) == pdTRUE) {
-    switch (tCmd.cmd) {
-      case TCMD_SUBIR_TEMP:   subirTemp(); break;
-      case TCMD_BAJAR_TEMP:   bajarTemp(); break;
-      case TCMD_SET_TEMP:     tempObjetivo = tCmd.value; break;
-      case TCMD_TOGGLE_HUM:   toggleHumManual(); break;
-      case TCMD_TOGGLE_CAL:   toggleCalManual(); break;
-      case TCMD_FORZAR_VOLTEO: forzarVolteoManual(); break;
-      case TCMD_SAVE:         guardarEstado(); break;
-      case TCMD_RESET:        borrarEstado(); break;
-      default: break;
-    }
-  }
+  procesarTelegram();
+  verificarAlertas();
 
-  // Mantener OTA por red (ArduinoOTA)
-  ArduinoOTA.handle();
-
-  // Leer comandos seriales
   procesarSerial();
-
-  // Procesar comandos del dashboard web
-  processWebCommands();
-
-  // Atender peticiones HTTP del dashboard
-  server.handleClient();
 }
+
+
+

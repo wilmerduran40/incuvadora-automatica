@@ -1,258 +1,235 @@
-# Incubadora Automatica v2.0 - ESP32
+# Incubadora Automatica - Version Minima Estable
 
-## Mapeo de Conexiones
+Firmware simplificado para ESP32 destinado al control de una incubadora automatica.
 
+Esta version elimina componentes que consumian muchos recursos y podian causar bloqueos:
+- Dashboard web, servidor DNS y modo AP.
+- Actualizacion OTA (ArduinoOTA y OTA por URL).
+- Tarea FreeRTOS dedicada a Telegram.
+- Perfiles predefinidos.
+- Comandos de Telegram que controlan actuadores.
 
-|Pin Modulo | Conexion|
-|JD-VCC     |5V DE LA FUENTE AL RELAY (RECOMENDADO USAR FUENTE INDIVIDUAL PARA EL MODULO RELAY)
-|VCC        |3.3 DEL ESP32|
-|GND        |GND COMUN (MODULO RELAY +ESP32)
-|IN1|IN2|IN3|GPIO 25/26/27
-|pUENTE AMARIILLO QUITADO DEL MODULO
-IN4 DEL MODULO RELAY LIBRE 
+Telegram ahora se usa **unicamente para monitoreo remoto** y alertas de temperatura fuera de rango.
 
+## Componentes
 
+- ESP32
+- Sensor DHT22 (AM2302)
+- Modulo relay 3 canales (calefactor, humificador, motor de volteo)
+- Pantalla TFT ST7789 170x320 IPS
+- Fuente 5V/2A minimo para el ESP32, TFT y logica del relay
+- Fuente adicional recomendada para las bobinas del relay (JD-VCC)
 
-### Pantalla TFT ST7789 (170x320 IPS)
+## Conexiones
 
-| Pin Pantalla | Pin ESP32 | Funcion       |
-|-------------|-----------|---------------|
-| BLK         | 3.3V      | Backlight     |
-| DC          | GPIO 16 (RX2) | Data/Command  |
-| CS          | GPIO 5        | Chip Select   |
-| RES         | GPIO 17 (TX2) | Reset         |
-| SDA         | GPIO 23       | Data SPI (MOSI) |
-| SCL         | GPIO 18       | Clock SPI (SCK) |
-| VCC         | 3.3V      | Alimentacion  |
-| GND         | GND       | Tierra        |
+### Modulo relay 3 canales
 
-> MISO no se conecta. Resolucion: 170x320. Tipo: IPS.
->
-> `Arduino_ESP32SPI(dc=16, cs=5, sck=18, mosi=23)`
->
-> `Arduino_ST7789(bus, rst=17, rotation=0, ips=true, w=170, h=320, col_offset1=35, row_offset1=0, col_offset2=35, row_offset2=0)`
+| Modulo relay | Conexion                                              |
+|--------------|-------------------------------------------------------|
+| JD-VCC       | 5V de fuente dedicada a bobinas (recomendado)         |
+| VCC          | 3.3V del ESP32 (logica optoacoplador)                 |
+| GND          | GND comun entre modulo relay y ESP32                  |
+| IN1          | GPIO 25 - Calefactor                                  |
+| IN2          | GPIO 26 - Humificador                                 |
+| IN3          | GPIO 27 - Motor de volteo                             |
 
-### Sensor DHT22 (AM2302)
+**Importante:** quitar el puente amarillo JD-VCC/VCC del modulo relay para aislar las bobinas del 3.3V del ESP32.
 
-| Pin Sensor | Pin ESP32 |
-|-----------|-----------|
-| DATA      | GPIO 4    |
-| VCC       | 3.3V      |
-| GND       | GND       |
+### Pantalla TFT ST7789
 
-### Modulo Relay 3 Canales (o 4 usando solo 1-3)
+| Pin pantalla | Pin ESP32 | Funcion       |
+|--------------|-----------|---------------|
+| BLK          | 3.3V      | Backlight     |
+| DC           | GPIO 16   | Data/Command  |
+| CS           | GPIO 5    | Chip Select   |
+| RES          | GPIO 17   | Reset         |
+| SDA          | GPIO 23   | MOSI          |
+| SCL          | GPIO 18   | SCK           |
+| VCC          | 3.3V      | Alimentacion  |
+| GND          | GND       | Tierra        |
 
-| Canal Relay | Pin ESP32 | Control       |
-|-------------|-----------|---------------|
-| Canal 1     | GPIO 25   | Calefactor    |
-| Canal 2     | GPIO 26   | Humificador   |
-| Canal 3     | GPIO 27   | Motor Rodillos |
+### Sensor DHT22
 
-> Relays **activos en LOW** (IN a GPIO). Firmware: HIGH antes de `pinMode(OUTPUT)`; actuadores solo tras sensor DHT valido y ~2 s de boot. No se usa ventilador por relay.
+| Pin sensor | Pin ESP32 |
+|------------|-----------|
+| DATA       | GPIO 4    |
+| VCC        | 3.3V      |
+| GND        | GND       |
 
-#### Puente amarillo (JD-VCC) — importante
-
-Muchos modulos 4 canales traen un **jumper amarillo** entre JD-VCC y VCC:
-
-| Modo | Que hacer | Efecto |
-|------|-----------|--------|
-| **Recomendado** | **Quitar el puente** | Bobinas aisladas del 3.3V del ESP32 |
-| Con puente | Comparten rail | Pico de corriente al reinicio puede congelar el ESP32 |
-
-**Cableado recomendado (sin puente):**
+### Resumen de pines ESP32
 
 ```
-Fuente 5V ──► JD-VCC (bobinas)     ESP32 3.3V ──► VCC (lado opto/logica)
-Fuente GND ──► GND del modulo  ◄── GND ESP32 (GND comun obligatorio)
-GPIO 25/26/27 ──► IN1..IN3
+GPIO 4   - DHT22 DATA
+GPIO 5   - TFT CS
+GPIO 16  - TFT DC
+GPIO 17  - TFT RES
+GPIO 18  - TFT SCL
+GPIO 23  - TFT SDA
+GPIO 25  - Relay calefactor
+GPIO 26  - Relay humificador
+GPIO 27  - Relay motor volteo
 ```
 
-**Si dejas el puente puesto:** el firmware mitiga el arranque (relays OFF + delay), pero sigue siendo preferible capacitor 1000uF y fuente 5V con margen.
+## Proteccion electrica recomendada
 
-## Resumen de Pines ESP32
+- **Capacitor electrolitico 1000uF/35V** entre 5V y GND lo mas cerca posible del ESP32.
+- **Capacitor ceramico 100nF** en paralelo para filtrar alta frecuencia.
+- **Puente JD-VCC quitado** y fuente separada para el relay.
+- Los actuadores de 110V (calefactor, humificador, motor) deben conectarse solo a traves del lado del relay, sin compartir GND con el ESP32.
 
-```
-GPIO 4   — DHT22 (DATA)
-GPIO 5   — TFT CS
-GPIO 16  — TFT DC
-GPIO 17  — TFT RES
-GPIO 18  — TFT SCL
-GPIO 23  — TFT SDA
-GPIO 25  — Relay Calefactor
-GPIO 26  — Relay Humificador
-GPIO 27  — Relay Motor Rodillos
-```
+## Librerias requeridas
 
-## Proteccion Electrica
-
-### 1. Arranque seguro de relays (firmware)
-
-Al reiniciar, `pinMode(OUTPUT)` en ESP32 deja el pin en LOW un instante. Con relays active-LOW eso enciende varias bobinas a la vez y puede tumbar el 5V.
-
-El firmware:
-1. Escribe HIGH en los 3 IN **antes** de `pinMode(OUTPUT)` (lo primero del `setup`).
-2. No habilita actuadores hasta sensor DHT valido y ~2 s de boot.
-3. Escaloná cambios de relay (~150 ms) para no activar varias bobinas a la vez.
-
-### 2. Capacitor de desacoplo (1000uF / 35V)
-
-El modulo relay y el ESP32 suelen compartir la entrada de 5V. Cuando las bobinas se activan, los picos de corriente pueden causar caidas de voltaje (brown-out) que congelan o resetean el ESP32.
-
-**Solucion:** Capacitor electrolitico de 1000uF (35V) instalado en paralelo con la entrada de 5V, lo mas cerca posible de los pines del ESP32.
-
-```
-Fuente 5V ─────┬──── ESP32 (VIN/5V)
-               │
-               ├── (+) Capacitor 1000uF 35V
-               │
-GND ───────────┴──── ESP32 GND
-```
-
-> **IMPORTANTE:** Respetar polaridad. Linea blanca del capacitor = GND. Terminal largo = 5V.
->
-> Opcional: agregar capacitor ceramico 100nF en paralelo para filtrado de alta frecuencia.
-
-## Arquitectura de Tareas (FreeRTOS)
-
-El ESP32 tiene 2 cores. El firmware los usa para separar el control de actuadores del trafico de red:
-
-| Tarea | Core | Funcion |
-|-------|------|---------|
-| `loop()` (principal) | Core 1 | Sensores, actuadores, pantalla TFT, serial, web server |
-| `telegramTask()` | Core 0 | Bot Telegram, WiFi, alertas, notificaciones |
-
-### Proteccion contra congelamiento (3 capas)
-
-| Capa | Mecanismo | Protege contra |
-|------|-----------|----------------|
-| 1. Capacitor 1000uF | Filtro electrico en rail 5V | Brown-out por picos de relay |
-| 2. Watchdog timer (10s) | Resetea el ESP32 si el loop se bloquea | Cuelgue de software / HTTPS bloqueante |
-| 3. Motor timeout (30s) | Apaga motor forzosamente si lleva 30s encendido | Motor 110V encendido indefinidamente |
-
-### Comunicacion entre tareas
-
-- **`StateSnapshot` + Mutex:** El loop copia el estado periodicamente a un snapshot protegido. Telegram lee la copia (sin acceder a variables compartidas).
-- **`Queue<TelegramCmdMsg>`:** Telegram envia comandos (subir/bajar temp, toggle cal/hum, volteo, etc.) al loop principal via una cola FreeRTOS.
-
-## Librerias Requeridas
 - AM2302-Sensor
 - Arduino_GFX_Library
 - UniversalTelegramBot
-- ArduinoJson (dependencia del bot)
+- ArduinoJson (dependencia de UniversalTelegramBot)
 
-## Perfiles de Incubacion
+## Configuracion inicial
 
-El sistema incluye perfiles predefinidos y personalizable:
+### 1. Cargar el firmware
 
-| Perfil | Dias | Lockdown | Temp | Hum desarrollo | Hum lockdown | Intervalo volteo |
-|--------|------|----------|------|----------------|--------------|------------------|
-| Pollo | 21 | Dia 18 | 37.6C | 50-55% | 65-70% | 2h (20s) |
-| Codorniz | 18 | Dia 14 | 37.5C | 45-50% | 60-65% | 2h (20s) |
-| Pavo | 28 | Dia 25 | 37.5C | 50-55% | 65-70% | 2h (25s) |
-| Pato | 28 | Dia 25 | 37.5C | 55-60% | 70-75% | 2h (25s) |
-| Personalizado | - | - | - | - | - | - |
+Abrir `incubadora/incubadora.ino` en Arduino IDE, seleccionar la placa ESP32 y subir.
 
-> **Desarrollo (dias 1-17):** Volteo automatico cada 2h, humedad 50-55%.
->
-> **Lockdown (dia 18+):** Volteo detenido, humedad 65-70%.
+### 2. Configurar WiFi y Telegram por serial
 
-## Fases de Incubacion
+Conectar a 115200 baud y enviar:
 
 ```
-Dia 1 -------- Dia 17 -------- Dia 18 -------- Dia 21
-|   DESARROLLO   |   LOCKDOWN (eclosion)   |
-| Volteo ON 2h   | Volteo OFF              |
-| Hum 50-55%     | Hum 65-70%              |
+wifi TU_SSID TU_CLAVE
+token 123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ
 ```
 
-## Proteccion contra Cortes Electricos
+El token se obtiene con [@BotFather](https://t.me/BotFather) en Telegram.
 
-El estado se guarda automaticamente cada 60 segundos en NVS flash (Preferences):
-- Uptime acumulado
-- Ultimo volteo
-- Perfil activo y parametros
-- Estado manual (calefactor/humificador)
+### 3. Autorizar el chat de Telegram
 
-Al reconectar, el ESP32 recupera el dia de incubacion calculando desde el uptime total.
+Enviar `/start` al bot. El primer chat que lo haga queda autorizado automaticamente. Tambien se puede autorizar manualmente por serial:
 
-## WiFi y Bot de Telegram
+```
+allow 123456789
+```
 
-El ESP32 guarda las credenciales WiFi, el token del bot y los chats permitidos en la flash (Preferences), asi no hay que recompilar para cambiarlas.
+## Comandos seriales
 
-### Configuracion por serial (115200 baud)
+### Control rapido
 
-1. `wifi MiRed miClave` -> guarda y conecta al WiFi.
-2. `token 123456:ABC...` -> guarda el token del bot (obtenlo con @BotFather).
-3. Abre el chat con tu bot y envia `/start` (el primer chat que lo haga queda autorizado automaticamente). Tambien puedes agregar chats con `allow <chat_id>`.
+| Comando | Accion                                  |
+|---------|-----------------------------------------|
+| `+` / `-` | Subir/bajar temp objetivo 0.5C        |
+| `temp 38.0` | Fijar temperatura objetivo            |
+| `h`       | Toggle humificador manual               |
+| `c`       | Toggle calefactor manual                |
+| `t`       | Volteo forzado                          |
+| `s`       | Guardar estado en NVS                   |
+| `r`       | Borrar estado y reiniciar               |
+| `d` / `info` | Mostrar informacion completa         |
+| `params`  | Mostrar parametros personalizados       |
+| `help`    | Mostrar ayuda                           |
 
-### Comandos del bot de Telegram
+### Configurar parametros del perfil
 
-| Comando    | Accion                       |
-|------------|------------------------------|
-| info       | Estado completo (temp, hum, dia, relays, volteo, uptime) |
-| + / -      | Subir/bajar temp objetivo    |
-| temp 38.0  | Fijar temp objetivo          |
-| h          | Toggle humificador manual    |
-| c          | Toggle calefactor manual     |
-| t          | Volteo forzado               |
-| s          | Guardar estado en flash      |
-| reset si   | Reset (borrar estado)        |
-| wifi       | Estado de la red             |
-| id         | Mostrar tu chat_id           |
-| help       | Ayuda                        |
+| Comando           | Descripcion                          |
+|-------------------|--------------------------------------|
+| `set dias 21`     | Dias totales de incubacion           |
+| `set lock 18`     | Dia de inicio del lockdown           |
+| `set tobj 37.6`   | Temperatura objetivo                 |
+| `set tmin 37.5`   | Temperatura minima (calefactor ON)   |
+| `set tmax 37.8`   | Temperatura maxima (calefactor OFF)  |
+| `set hmin 50`     | Humedad minima en desarrollo         |
+| `set hmax 55`     | Humedad maxima en desarrollo         |
+| `set hlmin 65`    | Humedad minima en lockdown           |
+| `set hlmax 70`    | Humedad maxima en lockdown           |
+| `set vol 2`       | Intervalo de volteo en horas         |
+| `set dur 20`      | Duracion de volteo en segundos       |
 
-> El bot tambien avisa automaticamente si la temperatura sale del rango y al entrar en LOCKDOWN (dia 18+).
+**Importante:** despues de cambiar parametros, enviar `s` para guardar en NVS.
 
-## Dashboard Web
+### Configuracion de red y Telegram
 
-El ESP32 ejecuta un servidor web en puerto 80 con dashboard completo:
-- Monitoreo en tiempo real (temp, hum, relays, fase)
-- Control remoto (calefactor, humificador, volteo)
-- Cambio de perfiles
-- Grafico historico (24h)
-- Configuracion WiFi/Telegram
+| Comando              | Accion                                 |
+|----------------------|----------------------------------------|
+| `wifi`               | Ver estado de WiFi                     |
+| `wifi SSID CLAVE`    | Guardar y conectar WiFi                |
+| `token TOKEN`        | Guardar token del bot                  |
+| `allow ID`           | Permitir chat                          |
+| `block ID`           | Bloquear chat                          |
+| `delwifi`            | Borrar credenciales WiFi               |
+| `deltoken`           | Borrar token del bot                   |
 
-**Acceso:** Conectate a la IP del ESP32 desde cualquier navegador en la misma red.
+## Comandos de Telegram
 
-> Si no hay WiFi configurado, el ESP32 activa modo AP: `Incubadora-Setup` / `incubadora123`.
+| Comando                  | Accion                                      |
+|--------------------------|---------------------------------------------|
+| `/start`                 | Bienvenida y autorizacion del primer chat   |
+| `info` / `estado`        | Estado completo de la incubadora            |
+| `help`                   | Lista de comandos                           |
+| `id`                     | Mostrar tu chat_id                          |
 
-## Actualizacion OTA (sin cable)
+**No se permiten comandos de control** de actuadores, reset ni OTA por Telegram. Solo lectura y alertas.
 
-El proyecto usa una particion personalizada (`incubadora.csv`) con 2 slots de app (~1,69MB cada uno), asi el OTA cabe en flash de 4MB.
+## Alertas automaticas
 
-### Configuracion una sola vez
-1. En Arduino IDE: **Tools -> Partition Scheme -> Custom** (usa `incubadora.csv` del sketch).
-2. Sube por USB una vez para grabar la tabla de particiones.
-3. Despues del arranque, en **Tools -> Port** aparece `incubadora` como puerto de red (ArduinoOTA).
+Si la temperatura sale del rango configurado (`tmin` a `tmax`), el bot envia:
 
-### Actualizar desde el IDE (por WiFi)
-- Selecciona el puerto de red `incubadora` en *Tools -> Port* y pulsa Upload (sin cable USB).
+```
+ALERTA: temperatura fuera de rango: XX.XC
+```
 
-### Actualizar por Telegram (`ota`)
-1. Compila y exporta el binario: *Sketch -> Export Compiled Binary*.
-2. Sube `incubadora.ino.bin` a un **GitHub Release** y copia la URL de descarga directa:
-   `https://github.com/<user>/<repo>/releases/download/<tag>/incubadora.ino.bin`
-3. Al bot: `ota <esa_url>` (solo chats autorizados). El ESP32 descarga, instala y reinicia. Si la escritura falla, sigue con la version actual; si el nuevo firmware no arranca, revierte automaticamente.
+Cuando vuelve al rango, envia:
 
-> Tambien por serial: `ota <url>`.
+```
+OK: temperatura en rango: XX.XC
+```
 
-## Comandos Serial (115200 baud)
+## Fases de incubacion
 
-| Comando          | Accion                             |
-|------------------|------------------------------------|
-| +/-              | Ajustar temp objetivo              |
-| temp 38.0        | Fijar temp objetivo                |
-| h                | Toggle humificador manual          |
-| c                | Toggle calefactor manual           |
-| t                | Volteo forzado                     |
-| s                | Guardar estado en flash            |
-| d / info         | Mostrar info                       |
-| r                | Reset (borrar estado de incubacion)|
-| wifi             | Estado de la red                   |
-| wifi ssid pass   | Guardar credenciales y conectar (tambien `wifi s=ssid p=pass`) |
-| token <TOKEN>    | Guardar token de Telegram (tambien `token t=<TOKEN>`; valida formato) |
-| delwifi / deltoken | Borrar credenciales/token        |
-| allow <id>       | Permitir chat de Telegram          |
-| block <id>       | Bloquear chat de Telegram          |
-| ota <url>        | Actualizar firmware (OTA)          |
-| help             | Ayuda                              |
+El sistema usa dos fases basadas en el dia actual:
+
+- **Desarrollo** (dia 1 hasta `lock - 1`): volteo automatico activo, humedad segun `hmin`/`hmax`.
+- **Lockdown** (dia `lock` en adelante): volteo desactivado, humedad segun `hlmin`/`hlmax`.
+
+El dia se calcula a partir del uptime acumulado, que se guarda en NVS cada 60 segundos para proteger contra cortes de energia.
+
+## Plan de prueba recomendado
+
+1. **Subir el firmware** y verificar que la pantalla muestre la interfaz y el sensor lea temperatura/humedad.
+2. **Prueba sin carga:** dejar encendido al menos 30 minutos sin conectar actuadores de 110V. Los relays pueden hacer click, pero el sistema no debe colgarse.
+3. **Prueba con calefactor:** conectar solo el calefactor y observar al menos 20 minutos.
+4. **Prueba completa:** conectar humificador y motor, observar comportamiento del volteo.
+5. **Prueba de cortes:** desconectar la alimentacion unos segundos y verificar que al reconectar recupere el dia y parametros.
+
+## Medidas de seguridad del firmware
+
+- Relays inicializados en OFF antes de configurar los pines como salida.
+- Actuadores habilitados solo despues de 2 segundos de arranque y con sensor valido.
+- Cambios de relay escalonados 150 ms para no activar varias bobinas a la vez.
+- Timeout de seguridad del motor: se apaga forzosamente a los 30 segundos.
+- Fail-safe del sensor: si hay 5 lecturas consecutivas invalidas, se apagan calefactor y humificador.
+- Watchdog de 5 segundos: reinicia el ESP32 si el loop principal se bloquea.
+- Si no hay WiFi configurado, el sistema sigue funcionando localmente sin intentar abrir modo AP.
+
+## Solucion de problemas
+
+### La incubadora se bloquea o reinicia sola
+
+1. Verificar que el puente JD-VCC del relay este quitado.
+2. Verificar capacitor 1000uF en la entrada de 5V del ESP32.
+3. Verificar que la fuente de 5V entregue al menos 2A estables.
+4. Asegurar que los GND del relay y del ESP32 esten unidos, pero que los actuadores de 110V no compartan GND con el ESP32.
+5. Revisar por serial si hay mensajes de error del sensor o del watchdog.
+
+### Telegram no responde
+
+1. Verificar que `token` este configurado correctamente.
+2. Verificar que el chat este autorizado (`allow ID`).
+3. Verificar que el ESP32 tenga conexion WiFi (comando `wifi` por serial).
+4. Esperar hasta 30 segundos; Telegram se consulta cada ese intervalo.
+
+### Los parametros se pierden al reiniciar
+
+Enviar `s` por serial despues de cualquier cambio con `set`. El guardado automatico ocurre cada 60 segundos.
+
+## Archivos
+
+- `incubadora/incubadora.ino` - firmware simplificado actual.
+- `incubadora/incubadora.ino.backup.original` - version completa anterior por si se necesita recuperar.
