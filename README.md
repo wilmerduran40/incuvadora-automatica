@@ -2,6 +2,16 @@
 
 ## Mapeo de Conexiones
 
+
+|Pin Modulo | Conexion|
+|JD-VCC     |5V DE LA FUENTE AL RELAY (RECOMENDADO USAR FUENTE INDIVIDUAL PARA EL MODULO RELAY)
+|VCC        |3.3 DEL ESP32|
+|GND        |GND COMUN (MODULO RELAY +ESP32)
+|IN1|IN2|IN3|GPIO 25/26/27
+|pUENTE AMARIILLO QUITADO DEL MODULO
+IN4 DEL MODULO RELAY LIBRE 
+
+
 ### Pantalla TFT ST7789 (170x320 IPS)
 
 | Pin Pantalla | Pin ESP32 | Funcion       |
@@ -29,16 +39,15 @@
 | VCC       | 3.3V      |
 | GND       | GND       |
 
-### Modulo Relay 4 Canales
+### Modulo Relay 3 Canales (o 4 usando solo 1-3)
 
 | Canal Relay | Pin ESP32 | Control       |
 |-------------|-----------|---------------|
 | Canal 1     | GPIO 25   | Calefactor    |
 | Canal 2     | GPIO 26   | Humificador   |
 | Canal 3     | GPIO 27   | Motor Rodillos |
-| Canal 4     | GPIO 33   | Ventilador    |
 
-> Relays **activos en LOW** (IN a GPIO). Firmware: HIGH antes de `pinMode(OUTPUT)` y actuadores habilitados ~500 ms tras el boot para evitar brown-out.
+> Relays **activos en LOW** (IN a GPIO). Firmware: HIGH antes de `pinMode(OUTPUT)`; actuadores solo tras sensor DHT valido y ~2 s de boot. No se usa ventilador por relay.
 
 #### Puente amarillo (JD-VCC) — importante
 
@@ -54,7 +63,7 @@ Muchos modulos 4 canales traen un **jumper amarillo** entre JD-VCC y VCC:
 ```
 Fuente 5V ──► JD-VCC (bobinas)     ESP32 3.3V ──► VCC (lado opto/logica)
 Fuente GND ──► GND del modulo  ◄── GND ESP32 (GND comun obligatorio)
-GPIO 25/26/27/33 ──► IN1..IN4
+GPIO 25/26/27 ──► IN1..IN3
 ```
 
 **Si dejas el puente puesto:** el firmware mitiga el arranque (relays OFF + delay), pero sigue siendo preferible capacitor 1000uF y fuente 5V con margen.
@@ -71,7 +80,6 @@ GPIO 23  — TFT SDA
 GPIO 25  — Relay Calefactor
 GPIO 26  — Relay Humificador
 GPIO 27  — Relay Motor Rodillos
-GPIO 33  — Relay Ventilador
 ```
 
 ## Proteccion Electrica
@@ -81,9 +89,9 @@ GPIO 33  — Relay Ventilador
 Al reiniciar, `pinMode(OUTPUT)` en ESP32 deja el pin en LOW un instante. Con relays active-LOW eso enciende varias bobinas a la vez y puede tumbar el 5V.
 
 El firmware:
-1. Escribe HIGH en los 4 IN **antes** de `pinMode(OUTPUT)`.
-2. Mantiene todos los relays OFF los primeros ~500 ms.
-3. Escaloná cambios de relay (~50 ms) para no activar varias bobinas a la vez.
+1. Escribe HIGH en los 3 IN **antes** de `pinMode(OUTPUT)` (lo primero del `setup`).
+2. No habilita actuadores hasta sensor DHT valido y ~2 s de boot.
+3. Escaloná cambios de relay (~150 ms) para no activar varias bobinas a la vez.
 
 ### 2. Capacitor de desacoplo (1000uF / 35V)
 
@@ -163,7 +171,6 @@ El estado se guarda automaticamente cada 60 segundos en NVS flash (Preferences):
 - Ultimo volteo
 - Perfil activo y parametros
 - Estado manual (calefactor/humificador)
-- Estado ventilador
 
 Al reconectar, el ESP32 recupera el dia de incubacion calculando desde el uptime total.
 
@@ -199,7 +206,7 @@ El ESP32 guarda las credenciales WiFi, el token del bot y los chats permitidos e
 
 El ESP32 ejecuta un servidor web en puerto 80 con dashboard completo:
 - Monitoreo en tiempo real (temp, hum, relays, fase)
-- Control remoto (calefactor, humificador, ventilador, volteo)
+- Control remoto (calefactor, humificador, volteo)
 - Cambio de perfiles
 - Grafico historico (24h)
 - Configuracion WiFi/Telegram

@@ -44,7 +44,6 @@ constexpr unsigned int PIN_DHT22       = 4;
 constexpr unsigned int PIN_RELAY_HEAT  = 25;
 constexpr unsigned int PIN_RELAY_HUM   = 26;
 constexpr unsigned int PIN_RELAY_MOTOR = 27;
-constexpr unsigned int PIN_RELAY_FAN   = 33;
 
 // ===================== OBJETOS =====================
 AM2302::AM2302_Sensor am2302(PIN_DHT22);
@@ -130,8 +129,6 @@ bool estadoCalefactor = false;
 bool estadoHumificador = false;
 bool motorVolteando = false;
 bool enLockdown = false;
-bool estadoVentilador = true;
-bool ventiladorManual = false;
 
 unsigned long ultimoVolteo = 0;
 unsigned long inicioVolteo = 0;
@@ -155,8 +152,9 @@ bool sensorCalentando = true;
 int sensorWarmupCount = 0;
 bool actuadoresListos = false;
 unsigned long millisArranque = 0;
-const unsigned long DELAY_ACTUADORES_MS = 500UL; // evita brown-out al boot con modulo relay
-const unsigned long STAGGER_RELAY_MS = 50UL;      // no activar varias bobinas a la vez
+const unsigned long DELAY_ACTUADORES_MS = 2000UL; // espera rail + sensor antes de actuadores
+const unsigned long STAGGER_RELAY_MS = 150UL;     // no activar varias bobinas a la vez
+bool sensorValido = false;
 unsigned long ultimoCambioRelay = 0;
 
 // ===================== HISTORICO PARA GRAFICOS =====================
@@ -187,13 +185,12 @@ volatile bool webCmdTempUp = false;
 volatile bool webCmdTempDown = false;
 volatile bool webCmdSave = false;
 volatile float webCmdTempSet = 0.0;
-volatile bool webCmdFan = false;
 volatile int webCmdProfileId = -1;
 volatile bool webCmdCustom = false;
 volatile float webCmdCustomParams[10] = {0};
 
 const char DASHBOARD_HTML[] PROGMEM =
-  "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>Dashboard Incubadora</title><style> :root { --bg: #0f1115; --card: #181b21; --text: #e0e0e0; --muted: #888; --green: #00c853; --red: #ff1744; --yellow: #ffd600; --cyan: #00e5ff; --magenta: #e040fb; --blue: #2979ff; --orange: #ff9100; } * { box-sizing: border-box; } body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 16px; line-height: 1.4; } h1 { text-align: center; margin: 0 0 16px; font-size: 1.5rem; color: var(--yellow); } .tabs { display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 1px solid #2a2f36; padding-bottom: 8px; } .tab-btn { flex: 1; background: transparent; border: none; color: var(--muted); padding: 10px; font-size: 0.95rem; cursor: pointer; border-radius: 8px; transition: all 0.2s; } .tab-btn.active { background: var(--card); color: var(--text); } .tab-content { display: none; } .tab-content.active { display: block; } .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; } .card { background: var(--card); border-radius: 12px; padding: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.3); margin-bottom: 12px; } .card h3 { margin: 0 0 10px; font-size: 0.8rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.5px; } .value { font-size: 2.2rem; font-weight: 700; margin: 4px 0; } .target { font-size: 0.8rem; color: var(--muted); } .status { margin-top: 8px; font-size: 0.9rem; font-weight: 600; } .ok { color: var(--green); } .bad { color: var(--red); } .warn { color: var(--yellow); } .cyan { color: var(--cyan); } .magenta { color: var(--magenta); } .blue { color: var(--blue); } .orange { color: var(--orange); } .full { grid-column: 1 / -1; } .progress-bar { width: 100%; height: 18px; background: #2a2f36; border-radius: 9px; overflow: hidden; margin-top: 10px; } .progress-fill { height: 100%; background: var(--green); transition: width 0.5s ease; } .progress-fill.lockdown { background: var(--magenta); } .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; } button, input[type=submit] { background: #2a2f36; color: var(--text); border: 1px solid #3a4049; border-radius: 8px; padding: 10px 14px; font-size: 0.9rem; cursor: pointer; transition: background 0.2s; } button:hover, input[type=submit]:hover { background: #3a4049; } button:active { transform: scale(0.98); } button.on { background: var(--green); color: #000; border-color: var(--green); } button.off { background: var(--red); color: #fff; border-color: var(--red); } .form-group { margin-bottom: 12px; } label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 4px; } input, select { width: 100%; background: #2a2f36; color: var(--text); border: 1px solid #3a4049; border-radius: 8px; padding: 10px; font-size: 0.95rem; } .system-info { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 0.9rem; } .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--card); color: var(--text); padding: 10px 18px; border-radius: 8px; border: 1px solid #3a4049; display: none; z-index: 100; } .chart-container { width: 100%; height: 260px; background: #0f1115; border-radius: 12px; padding: 10px; } svg { width: 100%; height: 100%; } .legend { display: flex; gap: 16px; font-size: 0.85rem; margin-bottom: 10px; } .legend span::before { content: \'\'; display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 4px; } .legend .temp::before { background: var(--red); } .legend .hum::before { background: var(--cyan); } @media (max-width: 400px) { .grid { grid-template-columns: 1fr; } .system-info { grid-template-columns: 1fr; } .value { font-size: 2rem; } } </style></head><body><h1>Dashboard Incubadora</h1><div class=\"tabs\"><button class=\"tab-btn active\" onclick=\"showTab(\'estado\')\">Estado</button><button class=\"tab-btn\" onclick=\"showTab(\'graficos\')\">Gráficos</button><button class=\"tab-btn\" onclick=\"showTab(\'config\')\">Configuración</button></div><div id=\"estado\" class=\"tab-content active\"><div class=\"card full\"><h3>Perfil de Incubación</h3><div class=\"controls\"><select id=\"perfil-select\" onchange=\"cambiarPerfil(this.value)\"><option value=\"0\">Pollo</option><option value=\"1\">Codorniz</option><option value=\"2\">Pavo</option><option value=\"3\">Pato</option><option value=\"4\">Personalizado</option></select></div><div class=\"target\" style=\"margin-top:8px\">Especies: <span id=\"perfil-nombre\">--</span></div></div><div class=\"grid\"><div class=\"card\"><h3>Temperatura</h3><div class=\"value\" id=\"temp\">--</div><div class=\"target\" id=\"temp-target\">Objetivo: --</div><div class=\"status\" id=\"cal-status\">CAL: --</div></div><div class=\"card\"><h3>Humedad</h3><div class=\"value\" id=\"hum\">--</div><div class=\"target\" id=\"hum-target\">Objetivo: --</div><div class=\"status\" id=\"hum-status\">HUM: --</div></div><div class=\"card\"><h3>Ventilador</h3><div class=\"value cyan\" id=\"fan\">--</div><div class=\"target\">Recirculación de aire</div><div class=\"controls\"><button id=\"fan-btn\" onclick=\"sendCmd(\'fan\')\">--</button></div></div><div class=\"card\"><h3>Sistema</h3><div class=\"system-info\"><div>WiFi: <span id=\"wifi\">--</span></div><div>IP: <span id=\"ip\">--</span></div><div>Bot: <span id=\"bot\">--</span></div><div>Modo: <span id=\"modo\">--</span></div></div></div></div><div class=\"card full\"><h3>Progreso de Incubación</h3><div> Día <strong id=\"dia\">--</strong>/<strong id=\"dias-total\">--</strong> - <span id=\"fase\" class=\"ok\">--</span></div><div class=\"progress-bar\"><div class=\"progress-fill\" id=\"progress\" style=\"width:0%\"></div></div><div class=\"target\" style=\"margin-top:6px\">Uptime: <span id=\"uptime\">--</span></div></div><div class=\"card full\"><h3>Volteo</h3><div id=\"volteo\" class=\"cyan\">--</div></div><div class=\"card full\"><h3>Control Manual</h3><div class=\"controls\"><button onclick=\"sendCmd(\'temp_up\')\">+ Temp</button><button onclick=\"sendCmd(\'temp_down\')\">- Temp</button><button onclick=\"sendCmd(\'cal\')\">Calefactor</button><button onclick=\"sendCmd(\'hum\')\">Humificador</button><button onclick=\"sendCmd(\'vol\')\">Forzar Volteo</button><button onclick=\"sendCmd(\'save\')\">Guardar Estado</button></div></div><div class=\"card full\"><h3>Última actualización</h3><div class=\"target\" id=\"last-update\">--</div></div></div><div id=\"graficos\" class=\"tab-content\"><div class=\"card full\"><h3>Histórico (últimas 24h)</h3><div class=\"legend\"><span class=\"temp\">Temperatura (°C)</span><span class=\"hum\">Humedad (%)</span></div><div class=\"chart-container\"><svg id=\"chart\" viewBox=\"0 0 600 240\" preserveAspectRatio=\"none\"><g id=\"chart-grid\"></g><path id=\"chart-temp\" fill=\"none\" stroke=\"#ff1744\" stroke-width=\"2\"></path><path id=\"chart-hum\" fill=\"none\" stroke=\"#00e5ff\" stroke-width=\"2\"></path></svg></div></div></div><div id=\"config\" class=\"tab-content\"><div class=\"card full\"><h3>Configuración WiFi</h3><form onsubmit=\"guardarConfig(event)\"><div class=\"form-group\"><label>SSID</label><input type=\"text\" id=\"cfg-ssid\" placeholder=\"Nombre de red\" required></div><div class=\"form-group\"><label>Contraseña</label><input type=\"password\" id=\"cfg-pass\" placeholder=\"Contraseña\"></div><div class=\"form-group\"><label>Token Bot Telegram</label><input type=\"text\" id=\"cfg-token\" placeholder=\"Opcional\"></div><div class=\"form-group\"><label>Chat IDs permitidos (separados por coma)</label><input type=\"text\" id=\"cfg-chats\" placeholder=\"Opcional\"></div><input type=\"submit\" value=\"Guardar y reiniciar\"></form></div><div class=\"card full\" id=\"custom-panel\" style=\"display:none\"><h3>Parámetros Personalizados</h3><form onsubmit=\"guardarCustom(event)\"><div class=\"grid\"><div class=\"form-group\"><label>Días totales</label><input type=\"number\" id=\"c-dias\" value=\"21\" required></div><div class=\"form-group\"><label>Día lockdown</label><input type=\"number\" id=\"c-lockdown\" value=\"18\" required></div><div class=\"form-group\"><label>Temp objetivo</label><input type=\"number\" step=\"0.1\" id=\"c-temp-obj\" value=\"37.6\" required></div><div class=\"form-group\"><label>Temp mínima</label><input type=\"number\" step=\"0.1\" id=\"c-temp-min\" value=\"37.5\" required></div><div class=\"form-group\"><label>Temp máxima</label><input type=\"number\" step=\"0.1\" id=\"c-temp-max\" value=\"37.8\" required></div><div class=\"form-group\"><label>Hum mín desarrollo</label><input type=\"number\" step=\"0.1\" id=\"c-hum-min-dev\" value=\"50\" required></div><div class=\"form-group\"><label>Hum máx desarrollo</label><input type=\"number\" step=\"0.1\" id=\"c-hum-max-dev\" value=\"55\" required></div><div class=\"form-group\"><label>Hum mín lockdown</label><input type=\"number\" step=\"0.1\" id=\"c-hum-min-lock\" value=\"65\" required></div><div class=\"form-group\"><label>Hum máx lockdown</label><input type=\"number\" step=\"0.1\" id=\"c-hum-max-lock\" value=\"70\" required></div><div class=\"form-group\"><label>Intervalo volteo (horas)</label><input type=\"number\" step=\"0.5\" id=\"c-volteo\" value=\"2\" required></div></div><input type=\"submit\" value=\"Aplicar personalizado\"></form></div></div><div class=\"toast\" id=\"toast\"></div><script> let currentData = {}; const fmtTime = s => { if (s < 60) return s + \'s\'; if (s < 3600) return Math.floor(s/60) + \'m \' + (s%60) + \'s\'; const h = Math.floor(s/3600); const m = Math.floor((s%3600)/60); return h + \'h \' + m + \'m\'; }; function showTab(id) { document.querySelectorAll(\'.tab-content\').forEach(el => el.classList.remove(\'active\')); document.querySelectorAll(\'.tab-btn\').forEach(el => el.classList.remove(\'active\')); document.getElementById(id).classList.add(\'active\'); event.target.classList.add(\'active\'); if (id === \'graficos\') cargarHistorico(); } function toast(msg) { const t = document.getElementById(\'toast\'); t.textContent = msg; t.style.display = \'block\'; setTimeout(() => t.style.display = \'none\', 2500); } async function update() { try { const res = await fetch(\'/api/status\'); const d = await res.json(); currentData = d; document.getElementById(\'temp\').textContent = d.temp.toFixed(1) + \'°C\'; document.getElementById(\'temp\').className = \'value \' + ((d.temp >= d.temp_min && d.temp <= d.temp_max) ? \'ok\' : \'bad\'); document.getElementById(\'temp-target\').textContent = \'Objetivo: \' + d.temp_obj.toFixed(1) + \'°C (\' + d.temp_min.toFixed(1) + \'-\' + d.temp_max.toFixed(1) + \')\'; const cal = document.getElementById(\'cal-status\'); cal.textContent = \'CAL: \' + (d.cal ? \'ON\' : \'OFF\'); cal.className = \'status \' + (d.cal ? \'ok\' : \'bad\'); document.getElementById(\'hum\').textContent = d.hum.toFixed(1) + \'%\'; document.getElementById(\'hum\').className = \'value \' + ((d.hum >= d.hum_min && d.hum <= d.hum_max) ? \'ok\' : \'warn\'); document.getElementById(\'hum-target\').textContent = \'Objetivo: \' + d.hum_min.toFixed(0) + \'-\' + d.hum_max.toFixed(0) + \'%\'; const hum = document.getElementById(\'hum-status\'); hum.textContent = \'HUM: \' + (d.humidor ? \'ON\' : \'OFF\'); hum.className = \'status \' + (d.humidor ? \'ok\' : \'bad\'); document.getElementById(\'fan\').textContent = d.fan ? \'ON\' : \'OFF\'; document.getElementById(\'fan\').className = \'value \' + (d.fan ? \'cyan\' : \'bad\'); const fanBtn = document.getElementById(\'fan-btn\'); fanBtn.textContent = d.fan ? \'Apagar ventilador\' : \'Encender ventilador\'; fanBtn.className = d.fan ? \'on\' : \'off\'; document.getElementById(\'perfil-select\').value = d.perfil_id; document.getElementById(\'perfil-nombre\').textContent = d.perfil; document.getElementById(\'custom-panel\').style.display = (d.perfil_id == 4) ? \'block\' : \'none\'; document.getElementById(\'dia\').textContent = d.dia; document.getElementById(\'dias-total\').textContent = d.dias_total; document.getElementById(\'fase\').textContent = d.fase; document.getElementById(\'fase\').className = d.lockdown ? \'magenta\' : \'ok\'; document.getElementById(\'progress\').style.width = ((d.dia / d.dias_total) * 100) + \'%\'; document.getElementById(\'progress\').className = \'progress-fill\' + (d.lockdown ? \' lockdown\' : \'\'); const vol = document.getElementById(\'volteo\'); if (d.lockdown) { vol.textContent = \'LOCKDOWN - Volteo detenido\'; vol.className = \'magenta\'; } else if (d.motor) { vol.textContent = \'GIRANDO\'; vol.className = \'warn\'; } else { vol.textContent = \'Próximo volteo: \' + fmtTime(d.volteo_restante); vol.className = \'cyan\'; } const wifi = document.getElementById(\'wifi\'); wifi.textContent = d.wifi ? \'Conectado\' : \'Desconectado\'; wifi.className = d.wifi ? \'ok\' : \'bad\'; document.getElementById(\'ip\').textContent = d.ip || \'---\'; const bot = document.getElementById(\'bot\'); bot.textContent = d.bot ? \'Activo\' : \'Inactivo\'; bot.className = d.bot ? \'ok\' : \'bad\'; const modo = document.getElementById(\'modo\'); modo.textContent = d.modo_ap ? \'AP\' : \'STA\'; modo.className = d.modo_ap ? \'warn\' : \'cyan\'; document.getElementById(\'uptime\').textContent = Math.floor(d.uptime / 3600) + \'h\'; document.getElementById(\'last-update\').textContent = new Date().toLocaleTimeString(); } catch (e) { console.error(\'Error actualizando:\', e); document.getElementById(\'last-update\').textContent = \'Error de conexión\'; } } async function sendCmd(action, value) { try { await fetch(\'/api/control?action=\' + encodeURIComponent(action) + (value ? \'&value=\' + encodeURIComponent(value) : \'\')); toast(\'Comando enviado\'); setTimeout(update, 300); } catch (e) { toast(\'Error enviando comando\'); } } async function cambiarPerfil(id) { await sendCmd(\'profile\', id); } async function guardarConfig(e) { e.preventDefault(); const ssid = document.getElementById(\'cfg-ssid\').value; const pass = document.getElementById(\'cfg-pass\').value; const token = document.getElementById(\'cfg-token\').value; const chats = document.getElementById(\'cfg-chats\').value; try { const res = await fetch(\'/api/config\', { method: \'POST\', headers: {\'Content-Type\': \'application/x-www-form-urlencoded\'}, body: \'ssid=\' + encodeURIComponent(ssid) + \'&pass=\' + encodeURIComponent(pass) + \'&token=\' + encodeURIComponent(token) + \'&chats=\' + encodeURIComponent(chats) }); const d = await res.json(); toast(d.msg); } catch (e) { toast(\'Error guardando configuración\'); } } async function guardarCustom(e) { e.preventDefault(); const params = { dias_total: document.getElementById(\'c-dias\').value, dia_lockdown: document.getElementById(\'c-lockdown\').value, temp_obj: document.getElementById(\'c-temp-obj\').value, temp_min: document.getElementById(\'c-temp-min\').value, temp_max: document.getElementById(\'c-temp-max\').value, hum_min_dev: document.getElementById(\'c-hum-min-dev\').value, hum_max_dev: document.getElementById(\'c-hum-max-dev\').value, hum_min_lock: document.getElementById(\'c-hum-min-lock\').value, hum_max_lock: document.getElementById(\'c-hum-max-lock\').value, intervalo_volteo_h: document.getElementById(\'c-volteo\').value }; let qs = \'action=custom\'; for (let k in params) qs += \'&\' + k + \'=\' + encodeURIComponent(params[k]); try { await fetch(\'/api/control?\' + qs); toast(\'Personalizado aplicado\'); setTimeout(update, 300); } catch (e) { toast(\'Error aplicando personalizado\'); } } async function cargarHistorico() { try { const res = await fetch(\'/api/history\'); const data = await res.json(); dibujarGrafico(data); } catch (e) { console.error(\'Error cargando histórico:\', e); } } function dibujarGrafico(data) { if (data.length < 2) return; const svg = document.getElementById(\'chart\'); const w = 600, h = 240, pad = 30; const gw = w - pad * 2, gh = h - pad * 2; let minT = 30, maxT = 45, minH = 20, maxH = 90; data.forEach(p => { if (p.temp < minT) minT = p.temp; if (p.temp > maxT) maxT = p.temp; if (p.hum < minH) minH = p.hum; if (p.hum > maxH) maxH = p.hum; }); minT = Math.floor(minT); maxT = Math.ceil(maxT); minH = Math.floor(minH / 10) * 10; maxH = Math.ceil(maxH / 10) * 10; const t0 = data[0].t, tn = data[data.length - 1].t; const dx = tn === t0 ? 0 : gw / (tn - t0); const pt = (x, y, min, max) => { const px = pad + (x - t0) * dx; const py = pad + gh - ((y - min) / (max - min)) * gh; return px.toFixed(1) + \',\' + py.toFixed(1); }; document.getElementById(\'chart-temp\').setAttribute(\'d\', \'M \' + data.map(p => pt(p.t, p.temp, minT, maxT)).join(\' L \')); document.getElementById(\'chart-hum\').setAttribute(\'d\', \'M \' + data.map(p => pt(p.t, p.hum, minH, maxH)).join(\' L \')); const grid = document.getElementById(\'chart-grid\'); grid.innerHTML = \'\'; for (let i = 0; i <= 4; i++) { const y = pad + (gh * i) / 4; grid.innerHTML += `<line x1=\"${pad}\" y1=\"${y}\" x2=\"${w-pad}\" y2=\"${y}\" stroke=\"#2a2f36\" stroke-width=\"1\"/>`; grid.innerHTML += `<text x=\"5\" y=\"${y+4}\" fill=\"#888\" font-size=\"10\">${(maxT - (maxT-minT)*i/4).toFixed(1)}</text>`; grid.innerHTML += `<text x=\"${w-pad+4}\" y=\"${y+4}\" fill=\"#888\" font-size=\"10\">${(maxH - (maxH-minH)*i/4).toFixed(0)}</text>`; } } update(); setInterval(update, 3000); </script></body></html> ";
+  "<!DOCTYPE html><html lang=\"es\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>Dashboard Incubadora</title><style> :root { --bg: #0f1115; --card: #181b21; --text: #e0e0e0; --muted: #888; --green: #00c853; --red: #ff1744; --yellow: #ffd600; --cyan: #00e5ff; --magenta: #e040fb; --blue: #2979ff; --orange: #ff9100; } * { box-sizing: border-box; } body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 16px; line-height: 1.4; } h1 { text-align: center; margin: 0 0 16px; font-size: 1.5rem; color: var(--yellow); } .tabs { display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 1px solid #2a2f36; padding-bottom: 8px; } .tab-btn { flex: 1; background: transparent; border: none; color: var(--muted); padding: 10px; font-size: 0.95rem; cursor: pointer; border-radius: 8px; transition: all 0.2s; } .tab-btn.active { background: var(--card); color: var(--text); } .tab-content { display: none; } .tab-content.active { display: block; } .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; } .card { background: var(--card); border-radius: 12px; padding: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.3); margin-bottom: 12px; } .card h3 { margin: 0 0 10px; font-size: 0.8rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.5px; } .value { font-size: 2.2rem; font-weight: 700; margin: 4px 0; } .target { font-size: 0.8rem; color: var(--muted); } .status { margin-top: 8px; font-size: 0.9rem; font-weight: 600; } .ok { color: var(--green); } .bad { color: var(--red); } .warn { color: var(--yellow); } .cyan { color: var(--cyan); } .magenta { color: var(--magenta); } .blue { color: var(--blue); } .orange { color: var(--orange); } .full { grid-column: 1 / -1; } .progress-bar { width: 100%; height: 18px; background: #2a2f36; border-radius: 9px; overflow: hidden; margin-top: 10px; } .progress-fill { height: 100%; background: var(--green); transition: width 0.5s ease; } .progress-fill.lockdown { background: var(--magenta); } .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; } button, input[type=submit] { background: #2a2f36; color: var(--text); border: 1px solid #3a4049; border-radius: 8px; padding: 10px 14px; font-size: 0.9rem; cursor: pointer; transition: background 0.2s; } button:hover, input[type=submit]:hover { background: #3a4049; } button:active { transform: scale(0.98); } button.on { background: var(--green); color: #000; border-color: var(--green); } button.off { background: var(--red); color: #fff; border-color: var(--red); } .form-group { margin-bottom: 12px; } label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 4px; } input, select { width: 100%; background: #2a2f36; color: var(--text); border: 1px solid #3a4049; border-radius: 8px; padding: 10px; font-size: 0.95rem; } .system-info { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 0.9rem; } .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--card); color: var(--text); padding: 10px 18px; border-radius: 8px; border: 1px solid #3a4049; display: none; z-index: 100; } .chart-container { width: 100%; height: 260px; background: #0f1115; border-radius: 12px; padding: 10px; } svg { width: 100%; height: 100%; } .legend { display: flex; gap: 16px; font-size: 0.85rem; margin-bottom: 10px; } .legend span::before { content: \'\'; display: inline-block; width: 12px; height: 12px; border-radius: 2px; margin-right: 4px; } .legend .temp::before { background: var(--red); } .legend .hum::before { background: var(--cyan); } @media (max-width: 400px) { .grid { grid-template-columns: 1fr; } .system-info { grid-template-columns: 1fr; } .value { font-size: 2rem; } } </style></head><body><h1>Dashboard Incubadora</h1><div class=\"tabs\"><button class=\"tab-btn active\" onclick=\"showTab(\'estado\')\">Estado</button><button class=\"tab-btn\" onclick=\"showTab(\'graficos\')\">Gráficos</button><button class=\"tab-btn\" onclick=\"showTab(\'config\')\">Configuración</button></div><div id=\"estado\" class=\"tab-content active\"><div class=\"card full\"><h3>Perfil de Incubación</h3><div class=\"controls\"><select id=\"perfil-select\" onchange=\"cambiarPerfil(this.value)\"><option value=\"0\">Pollo</option><option value=\"1\">Codorniz</option><option value=\"2\">Pavo</option><option value=\"3\">Pato</option><option value=\"4\">Personalizado</option></select></div><div class=\"target\" style=\"margin-top:8px\">Especies: <span id=\"perfil-nombre\">--</span></div></div><div class=\"grid\"><div class=\"card\"><h3>Temperatura</h3><div class=\"value\" id=\"temp\">--</div><div class=\"target\" id=\"temp-target\">Objetivo: --</div><div class=\"status\" id=\"cal-status\">CAL: --</div></div><div class=\"card\"><h3>Humedad</h3><div class=\"value\" id=\"hum\">--</div><div class=\"target\" id=\"hum-target\">Objetivo: --</div><div class=\"status\" id=\"hum-status\">HUM: --</div></div><div class=\"card\"><h3>Sistema</h3><div class=\"system-info\"><div>WiFi: <span id=\"wifi\">--</span></div><div>IP: <span id=\"ip\">--</span></div><div>Bot: <span id=\"bot\">--</span></div><div>Modo: <span id=\"modo\">--</span></div></div></div></div><div class=\"card full\"><h3>Progreso de Incubación</h3><div> Día <strong id=\"dia\">--</strong>/<strong id=\"dias-total\">--</strong> - <span id=\"fase\" class=\"ok\">--</span></div><div class=\"progress-bar\"><div class=\"progress-fill\" id=\"progress\" style=\"width:0%\"></div></div><div class=\"target\" style=\"margin-top:6px\">Uptime: <span id=\"uptime\">--</span></div></div><div class=\"card full\"><h3>Volteo</h3><div id=\"volteo\" class=\"cyan\">--</div></div><div class=\"card full\"><h3>Control Manual</h3><div class=\"controls\"><button onclick=\"sendCmd(\'temp_up\')\">+ Temp</button><button onclick=\"sendCmd(\'temp_down\')\">- Temp</button><button onclick=\"sendCmd(\'cal\')\">Calefactor</button><button onclick=\"sendCmd(\'hum\')\">Humificador</button><button onclick=\"sendCmd(\'vol\')\">Forzar Volteo</button><button onclick=\"sendCmd(\'save\')\">Guardar Estado</button></div></div><div class=\"card full\"><h3>Última actualización</h3><div class=\"target\" id=\"last-update\">--</div></div></div><div id=\"graficos\" class=\"tab-content\"><div class=\"card full\"><h3>Histórico (últimas 24h)</h3><div class=\"legend\"><span class=\"temp\">Temperatura (°C)</span><span class=\"hum\">Humedad (%)</span></div><div class=\"chart-container\"><svg id=\"chart\" viewBox=\"0 0 600 240\" preserveAspectRatio=\"none\"><g id=\"chart-grid\"></g><path id=\"chart-temp\" fill=\"none\" stroke=\"#ff1744\" stroke-width=\"2\"></path><path id=\"chart-hum\" fill=\"none\" stroke=\"#00e5ff\" stroke-width=\"2\"></path></svg></div></div></div><div id=\"config\" class=\"tab-content\"><div class=\"card full\"><h3>Configuración WiFi</h3><form onsubmit=\"guardarConfig(event)\"><div class=\"form-group\"><label>SSID</label><input type=\"text\" id=\"cfg-ssid\" placeholder=\"Nombre de red\" required></div><div class=\"form-group\"><label>Contraseña</label><input type=\"password\" id=\"cfg-pass\" placeholder=\"Contraseña\"></div><div class=\"form-group\"><label>Token Bot Telegram</label><input type=\"text\" id=\"cfg-token\" placeholder=\"Opcional\"></div><div class=\"form-group\"><label>Chat IDs permitidos (separados por coma)</label><input type=\"text\" id=\"cfg-chats\" placeholder=\"Opcional\"></div><input type=\"submit\" value=\"Guardar y reiniciar\"></form></div><div class=\"card full\" id=\"custom-panel\" style=\"display:none\"><h3>Parámetros Personalizados</h3><form onsubmit=\"guardarCustom(event)\"><div class=\"grid\"><div class=\"form-group\"><label>Días totales</label><input type=\"number\" id=\"c-dias\" value=\"21\" required></div><div class=\"form-group\"><label>Día lockdown</label><input type=\"number\" id=\"c-lockdown\" value=\"18\" required></div><div class=\"form-group\"><label>Temp objetivo</label><input type=\"number\" step=\"0.1\" id=\"c-temp-obj\" value=\"37.6\" required></div><div class=\"form-group\"><label>Temp mínima</label><input type=\"number\" step=\"0.1\" id=\"c-temp-min\" value=\"37.5\" required></div><div class=\"form-group\"><label>Temp máxima</label><input type=\"number\" step=\"0.1\" id=\"c-temp-max\" value=\"37.8\" required></div><div class=\"form-group\"><label>Hum mín desarrollo</label><input type=\"number\" step=\"0.1\" id=\"c-hum-min-dev\" value=\"50\" required></div><div class=\"form-group\"><label>Hum máx desarrollo</label><input type=\"number\" step=\"0.1\" id=\"c-hum-max-dev\" value=\"55\" required></div><div class=\"form-group\"><label>Hum mín lockdown</label><input type=\"number\" step=\"0.1\" id=\"c-hum-min-lock\" value=\"65\" required></div><div class=\"form-group\"><label>Hum máx lockdown</label><input type=\"number\" step=\"0.1\" id=\"c-hum-max-lock\" value=\"70\" required></div><div class=\"form-group\"><label>Intervalo volteo (horas)</label><input type=\"number\" step=\"0.5\" id=\"c-volteo\" value=\"2\" required></div></div><input type=\"submit\" value=\"Aplicar personalizado\"></form></div></div><div class=\"toast\" id=\"toast\"></div><script> let currentData = {}; const fmtTime = s => { if (s < 60) return s + \'s\'; if (s < 3600) return Math.floor(s/60) + \'m \' + (s%60) + \'s\'; const h = Math.floor(s/3600); const m = Math.floor((s%3600)/60); return h + \'h \' + m + \'m\'; }; function showTab(id) { document.querySelectorAll(\'.tab-content\').forEach(el => el.classList.remove(\'active\')); document.querySelectorAll(\'.tab-btn\').forEach(el => el.classList.remove(\'active\')); document.getElementById(id).classList.add(\'active\'); event.target.classList.add(\'active\'); if (id === \'graficos\') cargarHistorico(); } function toast(msg) { const t = document.getElementById(\'toast\'); t.textContent = msg; t.style.display = \'block\'; setTimeout(() => t.style.display = \'none\', 2500); } async function update() { try { const res = await fetch(\'/api/status\'); const d = await res.json(); currentData = d; document.getElementById(\'temp\').textContent = d.temp.toFixed(1) + \'°C\'; document.getElementById(\'temp\').className = \'value \' + ((d.temp >= d.temp_min && d.temp <= d.temp_max) ? \'ok\' : \'bad\'); document.getElementById(\'temp-target\').textContent = \'Objetivo: \' + d.temp_obj.toFixed(1) + \'°C (\' + d.temp_min.toFixed(1) + \'-\' + d.temp_max.toFixed(1) + \')\'; const cal = document.getElementById(\'cal-status\'); cal.textContent = \'CAL: \' + (d.cal ? \'ON\' : \'OFF\'); cal.className = \'status \' + (d.cal ? \'ok\' : \'bad\'); document.getElementById(\'hum\').textContent = d.hum.toFixed(1) + \'%\'; document.getElementById(\'hum\').className = \'value \' + ((d.hum >= d.hum_min && d.hum <= d.hum_max) ? \'ok\' : \'warn\'); document.getElementById(\'hum-target\').textContent = \'Objetivo: \' + d.hum_min.toFixed(0) + \'-\' + d.hum_max.toFixed(0) + \'%\'; const hum = document.getElementById(\'hum-status\'); hum.textContent = \'HUM: \' + (d.humidor ? \'ON\' : \'OFF\'); hum.className = \'status \' + (d.humidor ? \'ok\' : \'bad\'); document.getElementById(\'perfil-select\').value = d.perfil_id; document.getElementById(\'perfil-nombre\').textContent = d.perfil; document.getElementById(\'custom-panel\').style.display = (d.perfil_id == 4) ? \'block\' : \'none\'; document.getElementById(\'dia\').textContent = d.dia; document.getElementById(\'dias-total\').textContent = d.dias_total; document.getElementById(\'fase\').textContent = d.fase; document.getElementById(\'fase\').className = d.lockdown ? \'magenta\' : \'ok\'; document.getElementById(\'progress\').style.width = ((d.dia / d.dias_total) * 100) + \'%\'; document.getElementById(\'progress\').className = \'progress-fill\' + (d.lockdown ? \' lockdown\' : \'\'); const vol = document.getElementById(\'volteo\'); if (d.lockdown) { vol.textContent = \'LOCKDOWN - Volteo detenido\'; vol.className = \'magenta\'; } else if (d.motor) { vol.textContent = \'GIRANDO\'; vol.className = \'warn\'; } else { vol.textContent = \'Próximo volteo: \' + fmtTime(d.volteo_restante); vol.className = \'cyan\'; } const wifi = document.getElementById(\'wifi\'); wifi.textContent = d.wifi ? \'Conectado\' : \'Desconectado\'; wifi.className = d.wifi ? \'ok\' : \'bad\'; document.getElementById(\'ip\').textContent = d.ip || \'---\'; const bot = document.getElementById(\'bot\'); bot.textContent = d.bot ? \'Activo\' : \'Inactivo\'; bot.className = d.bot ? \'ok\' : \'bad\'; const modo = document.getElementById(\'modo\'); modo.textContent = d.modo_ap ? \'AP\' : \'STA\'; modo.className = d.modo_ap ? \'warn\' : \'cyan\'; document.getElementById(\'uptime\').textContent = Math.floor(d.uptime / 3600) + \'h\'; document.getElementById(\'last-update\').textContent = new Date().toLocaleTimeString(); } catch (e) { console.error(\'Error actualizando:\', e); document.getElementById(\'last-update\').textContent = \'Error de conexión\'; } } async function sendCmd(action, value) { try { await fetch(\'/api/control?action=\' + encodeURIComponent(action) + (value ? \'&value=\' + encodeURIComponent(value) : \'\')); toast(\'Comando enviado\'); setTimeout(update, 300); } catch (e) { toast(\'Error enviando comando\'); } } async function cambiarPerfil(id) { await sendCmd(\'profile\', id); } async function guardarConfig(e) { e.preventDefault(); const ssid = document.getElementById(\'cfg-ssid\').value; const pass = document.getElementById(\'cfg-pass\').value; const token = document.getElementById(\'cfg-token\').value; const chats = document.getElementById(\'cfg-chats\').value; try { const res = await fetch(\'/api/config\', { method: \'POST\', headers: {\'Content-Type\': \'application/x-www-form-urlencoded\'}, body: \'ssid=\' + encodeURIComponent(ssid) + \'&pass=\' + encodeURIComponent(pass) + \'&token=\' + encodeURIComponent(token) + \'&chats=\' + encodeURIComponent(chats) }); const d = await res.json(); toast(d.msg); } catch (e) { toast(\'Error guardando configuración\'); } } async function guardarCustom(e) { e.preventDefault(); const params = { dias_total: document.getElementById(\'c-dias\').value, dia_lockdown: document.getElementById(\'c-lockdown\').value, temp_obj: document.getElementById(\'c-temp-obj\').value, temp_min: document.getElementById(\'c-temp-min\').value, temp_max: document.getElementById(\'c-temp-max\').value, hum_min_dev: document.getElementById(\'c-hum-min-dev\').value, hum_max_dev: document.getElementById(\'c-hum-max-dev\').value, hum_min_lock: document.getElementById(\'c-hum-min-lock\').value, hum_max_lock: document.getElementById(\'c-hum-max-lock\').value, intervalo_volteo_h: document.getElementById(\'c-volteo\').value }; let qs = \'action=custom\'; for (let k in params) qs += \'&\' + k + \'=\' + encodeURIComponent(params[k]); try { await fetch(\'/api/control?\' + qs); toast(\'Personalizado aplicado\'); setTimeout(update, 300); } catch (e) { toast(\'Error aplicando personalizado\'); } } async function cargarHistorico() { try { const res = await fetch(\'/api/history\'); const data = await res.json(); dibujarGrafico(data); } catch (e) { console.error(\'Error cargando histórico:\', e); } } function dibujarGrafico(data) { if (data.length < 2) return; const svg = document.getElementById(\'chart\'); const w = 600, h = 240, pad = 30; const gw = w - pad * 2, gh = h - pad * 2; let minT = 30, maxT = 45, minH = 20, maxH = 90; data.forEach(p => { if (p.temp < minT) minT = p.temp; if (p.temp > maxT) maxT = p.temp; if (p.hum < minH) minH = p.hum; if (p.hum > maxH) maxH = p.hum; }); minT = Math.floor(minT); maxT = Math.ceil(maxT); minH = Math.floor(minH / 10) * 10; maxH = Math.ceil(maxH / 10) * 10; const t0 = data[0].t, tn = data[data.length - 1].t; const dx = tn === t0 ? 0 : gw / (tn - t0); const pt = (x, y, min, max) => { const px = pad + (x - t0) * dx; const py = pad + gh - ((y - min) / (max - min)) * gh; return px.toFixed(1) + \',\' + py.toFixed(1); }; document.getElementById(\'chart-temp\').setAttribute(\'d\', \'M \' + data.map(p => pt(p.t, p.temp, minT, maxT)).join(\' L \')); document.getElementById(\'chart-hum\').setAttribute(\'d\', \'M \' + data.map(p => pt(p.t, p.hum, minH, maxH)).join(\' L \')); const grid = document.getElementById(\'chart-grid\'); grid.innerHTML = \'\'; for (let i = 0; i <= 4; i++) { const y = pad + (gh * i) / 4; grid.innerHTML += `<line x1=\"${pad}\" y1=\"${y}\" x2=\"${w-pad}\" y2=\"${y}\" stroke=\"#2a2f36\" stroke-width=\"1\"/>`; grid.innerHTML += `<text x=\"5\" y=\"${y+4}\" fill=\"#888\" font-size=\"10\">${(maxT - (maxT-minT)*i/4).toFixed(1)}</text>`; grid.innerHTML += `<text x=\"${w-pad+4}\" y=\"${y+4}\" fill=\"#888\" font-size=\"10\">${(maxH - (maxH-minH)*i/4).toFixed(0)}</text>`; } } update(); setInterval(update, 3000); </script></body></html> ";
 
 // ===================== TAREA TELEGRAM (CORE 0) =====================
 // La tarea de Telegram corre en core 0 para no bloquear el loop principal (core 1).
@@ -209,8 +206,7 @@ enum TelegramCmdType {
   TCMD_FORZAR_VOLTEO,
   TCMD_SAVE,
   TCMD_RESET,
-  TCMD_APLICAR_PERFIL,
-  TCMD_TOGGLE_VENTILADOR
+  TCMD_APLICAR_PERFIL
 };
 
 struct TelegramCmdMsg {
@@ -232,7 +228,6 @@ struct StateSnapshot {
   bool estadoCalefactor;
   bool estadoHumificador;
   bool motorVolteando;
-  bool estadoVentilador;
   bool enLockdown;
   int diaActual;
   int perfilDiasTotal;
@@ -269,7 +264,6 @@ void guardarEstado() {
   preferences.putFloat("p_hum_max_lock", perfilActivo.hum_max_lockdown);
   preferences.putULong("p_int_volteo", perfilActivo.intervalo_volteo_ms);
   preferences.putULong("p_dur_volteo", perfilActivo.duracion_volteo_ms);
-  preferences.putBool("fan_on", estadoVentilador);
 
   preferences.end();
   Serial.println(F("Estado guardado."));
@@ -300,7 +294,6 @@ void cargarEstado() {
   perfilActivo.hum_max_lockdown = preferences.getFloat("p_hum_max_lock", base.hum_max_lockdown);
   perfilActivo.intervalo_volteo_ms = preferences.getULong("p_int_volteo", base.intervalo_volteo_ms);
   perfilActivo.duracion_volteo_ms = preferences.getULong("p_dur_volteo", base.duracion_volteo_ms);
-  estadoVentilador = preferences.getBool("fan_on", true);
 
   preferences.end();
 
@@ -329,7 +322,6 @@ void borrarEstado() {
   tempObjetivo = perfilActivo.temp_objetivo;
   tempMin = perfilActivo.temp_min;
   tempMax = perfilActivo.temp_max;
-  estadoVentilador = true;
 
   Serial.println(F("Estado borrado. Reiniciando."));
 }
@@ -560,15 +552,12 @@ void relaysInitSeguro() {
   digitalWrite(PIN_RELAY_HEAT, HIGH);
   digitalWrite(PIN_RELAY_HUM, HIGH);
   digitalWrite(PIN_RELAY_MOTOR, HIGH);
-  digitalWrite(PIN_RELAY_FAN, HIGH);
   pinMode(PIN_RELAY_HEAT, OUTPUT);
   pinMode(PIN_RELAY_HUM, OUTPUT);
   pinMode(PIN_RELAY_MOTOR, OUTPUT);
-  pinMode(PIN_RELAY_FAN, OUTPUT);
   digitalWrite(PIN_RELAY_HEAT, HIGH);
   digitalWrite(PIN_RELAY_HUM, HIGH);
   digitalWrite(PIN_RELAY_MOTOR, HIGH);
-  digitalWrite(PIN_RELAY_FAN, HIGH);
   estadoCalefactor = false;
   estadoHumificador = false;
   motorVolteando = false;
@@ -586,7 +575,7 @@ bool relayPuedeCambiar() {
 }
 
 void controlarCalefactor() {
-  if (!actuadoresListos || manualCal) return;
+  if (!actuadoresListos || !sensorValido || manualCal) return;
 
   if (temperatura < tempMin && !estadoCalefactor) {
     if (!relayPuedeCambiar()) return;
@@ -600,7 +589,7 @@ void controlarCalefactor() {
 }
 
 void controlarHumificador() {
-  if (!actuadoresListos) return;
+  if (!actuadoresListos || !sensorValido) return;
 
   float humMin = obtenerHumMin();
   float humMax = obtenerHumMax();
@@ -630,7 +619,7 @@ void controlarHumificador() {
 }
 
 void iniciarVolteo() {
-  if (!actuadoresListos || motorVolteando || enLockdown) return;
+  if (!actuadoresListos || !sensorValido || motorVolteando || enLockdown) return;
   if (!relayPuedeCambiar()) return;
   motorVolteando = true;
   inicioVolteo = millis();
@@ -642,36 +631,6 @@ void detenerVolteo() {
   motorVolteando = false;
   ultimoVolteo = obtenerUptimeTotal();
   ultimoCambioRelay = millis();
-}
-
-void controlarVentilador() {
-  if (!actuadoresListos || ventiladorManual) return;
-  // Reafirma estado sin stagger: si el pin ya esta asi, no hay pico de corriente
-  digitalWrite(PIN_RELAY_FAN, estadoVentilador ? LOW : HIGH);
-}
-
-void encenderVentilador() {
-  estadoVentilador = true;
-  ventiladorManual = false;
-  if (!actuadoresListos) return;
-  digitalWrite(PIN_RELAY_FAN, LOW);
-  ultimoCambioRelay = millis();
-}
-
-void apagarVentilador() {
-  estadoVentilador = false;
-  ventiladorManual = true;
-  if (!actuadoresListos) return;
-  digitalWrite(PIN_RELAY_FAN, HIGH);
-  ultimoCambioRelay = millis();
-}
-
-void toggleVentilador() {
-  if (estadoVentilador) {
-    apagarVentilador();
-  } else {
-    encenderVentilador();
-  }
 }
 
 void verificarVolteo(unsigned long ahora) {
@@ -700,8 +659,16 @@ void leerSensor() {
   unsigned long duracion = millis() - t0;
 
   if (status == AM2302::AM2302_READ_OK) {
-    temperatura = am2302.get_Temperature();
-    humedad = am2302.get_Humidity();
+    float t = am2302.get_Temperature();
+    float h = am2302.get_Humidity();
+    if (t >= 10.0 && t <= 50.0 && h >= 5.0 && h <= 100.0) {
+      temperatura = t;
+      humedad = h;
+      if (!sensorValido) {
+        sensorValido = true;
+        Serial.println(F("Sensor DHT22 valido."));
+      }
+    }
     if (duracion > 500) {
       Serial.print(F("Lectura DHT lenta: "));
       Serial.print(duracion);
@@ -811,9 +778,7 @@ void mostrarInfoSerial() {
   Serial.print(F("  Hum: "));
   Serial.print(estadoHumificador ? "ON" : "OFF");
   Serial.print(F("  Motor: "));
-  Serial.print(motorVolteando ? "ON" : "OFF");
-  Serial.print(F("  Fan: "));
-  Serial.println(estadoVentilador ? "ON" : "OFF");
+  Serial.println(motorVolteando ? "ON" : "OFF");
   Serial.print(F("Uptime: "));
   Serial.print(obtenerUptimeTotal() / 3600000UL);
   Serial.println(F(" horas"));
@@ -840,7 +805,6 @@ String obtenerInfoTelegram() {
       "Calefactor: %s\n"
       "Humificador: %s\n"
       "Motor: %s\n"
-      "Ventilador: %s\n"
       "Prox. volteo: %luh %lum\n"
       "Uptime: %luh",
       perfilActivo.nombre,
@@ -851,7 +815,6 @@ String obtenerInfoTelegram() {
       estadoCalefactor ? "ON" : "OFF",
       estadoHumificador ? "ON" : "OFF",
       motorVolteando ? "GIRANDO" : "OFF",
-      estadoVentilador ? "ON" : "OFF",
       rest / 3600, (rest % 3600) / 60,
       uptimeH);
   } else {
@@ -865,7 +828,6 @@ String obtenerInfoTelegram() {
       "Calefactor: %s\n"
       "Humificador: %s\n"
       "Motor: %s\n"
-      "Ventilador: %s\n"
       "Uptime: %luh",
       perfilActivo.nombre,
       diaActual, perfilActivo.dias_total,
@@ -875,7 +837,6 @@ String obtenerInfoTelegram() {
       estadoCalefactor ? "ON" : "OFF",
       estadoHumificador ? "ON" : "OFF",
       motorVolteando ? "GIRANDO" : "OFF",
-      estadoVentilador ? "ON" : "OFF",
       uptimeH);
   }
   return String(buf);
@@ -938,7 +899,6 @@ void handleStatus() {
     "\"cal\":%s,"
     "\"humidor\":%s,"
     "\"motor\":%s,"
-    "\"fan\":%s,"
     "\"dia\":%d,"
     "\"dias_total\":%d,"
     "\"dia_lockdown\":%d,"
@@ -958,7 +918,6 @@ void handleStatus() {
     estadoCalefactor ? "true" : "false",
     estadoHumificador ? "true" : "false",
     motorVolteando ? "true" : "false",
-    estadoVentilador ? "true" : "false",
     diaActual, perfilActivo.dias_total, perfilActivo.dia_lockdown,
     enLockdown ? "LOCKDOWN" : "DESARROLLO",
     enLockdown ? "true" : "false",
@@ -984,8 +943,6 @@ void handleControl() {
     webCmdHum = true;
   } else if (action == "vol") {
     webCmdVol = true;
-  } else if (action == "fan") {
-    webCmdFan = true;
   } else if (action == "temp_up") {
     webCmdTempUp = true;
   } else if (action == "temp_down") {
@@ -1127,10 +1084,6 @@ void processWebCommands() {
   if (webCmdVol) {
     forzarVolteoManual();
     webCmdVol = false;
-  }
-  if (webCmdFan) {
-    toggleVentilador();
-    webCmdFan = false;
   }
   if (webCmdTempUp) {
     subirTemp();
@@ -1331,7 +1284,6 @@ void actualizarSnapshot() {
     snap.estadoCalefactor = estadoCalefactor;
     snap.estadoHumificador = estadoHumificador;
     snap.motorVolteando = motorVolteando;
-    snap.estadoVentilador = estadoVentilador;
     snap.enLockdown = enLockdown;
     snap.diaActual = diaActual;
     snap.perfilDiasTotal = perfilActivo.dias_total;
@@ -1370,7 +1322,6 @@ String obtenerInfoSnapshot() {
       "Calefactor: %s\n"
       "Humificador: %s\n"
       "Motor: %s\n"
-      "Ventilador: %s\n"
       "Prox. volteo: %luh %lum\n"
       "Uptime: %luh",
       s.perfilNombre,
@@ -1381,7 +1332,6 @@ String obtenerInfoSnapshot() {
       s.estadoCalefactor ? "ON" : "OFF",
       s.estadoHumificador ? "ON" : "OFF",
       s.motorVolteando ? "GIRANDO" : "OFF",
-      s.estadoVentilador ? "ON" : "OFF",
       rest / 3600, (rest % 3600) / 60,
       uptimeH);
   } else {
@@ -1395,7 +1345,6 @@ String obtenerInfoSnapshot() {
       "Calefactor: %s\n"
       "Humificador: %s\n"
       "Motor: %s\n"
-      "Ventilador: %s\n"
       "Uptime: %luh",
       s.perfilNombre,
       s.diaActual, s.perfilDiasTotal,
@@ -1405,7 +1354,6 @@ String obtenerInfoSnapshot() {
       s.estadoCalefactor ? "ON" : "OFF",
       s.estadoHumificador ? "ON" : "OFF",
       s.motorVolteando ? "GIRANDO" : "OFF",
-      s.estadoVentilador ? "ON" : "OFF",
       uptimeH);
   }
   return String(buf);
@@ -1831,15 +1779,6 @@ void dibujarPantalla() {
     gfx->setTextColor(COLOR_RED);
     gfx->print("t");
   }
-  gfx->setCursor(160, 296);
-  if (estadoVentilador) {
-    gfx->setTextColor(COLOR_GREEN);
-    gfx->print("F");
-  } else {
-    gfx->setTextColor(COLOR_RED);
-    gfx->print("f");
-  }
-
   // ---- COMANDOS ----
   gfx->setCursor(0, 308);
   gfx->setTextColor(COLOR_DKGREY);
@@ -1994,9 +1933,14 @@ void procesarSerial() {
 // ===================== SETUP =====================
 
 void setup() {
+  // Relays OFF cuanto antes (antes de Serial/NVS: evita bobinas al boot)
+  relaysInitSeguro();
+  millisArranque = millis();
+
   Serial.begin(115200);
 
   Serial.println(F("\n=== Incubadora Automatica v2.0 ==="));
+  Serial.println(F("Relays en OFF (arranque seguro)."));
 
   // Proteccion contra crash-loop por NVS corrupto tras cortes de energia
   {
@@ -2019,10 +1963,6 @@ void setup() {
     }
   }
 
-  // Relays OFF cuanto antes (HIGH antes de OUTPUT evita pico de corriente al boot)
-  relaysInitSeguro();
-  millisArranque = millis();
-
   // Watchdog: Arduino ya inicializa el TWDT. Reconfigurar para cubrir ambos cores.
   esp_task_wdt_config_t twdt_config = {};
   twdt_config.timeout_ms = 30000;
@@ -2030,7 +1970,6 @@ void setup() {
   twdt_config.trigger_panic = true;
   esp_task_wdt_reconfigure(&twdt_config);
   Serial.println(F("Watchdog reconfigurado (30s, ambos cores)."));
-  Serial.println(F("Relays en OFF (arranque seguro)."));
 
   // Pantalla con retry (max 2 intentos, no bloquea el sistema si falla)
   for (int intento = 0; intento < 2; intento++) {
@@ -2118,7 +2057,6 @@ void setup() {
     digitalWrite(PIN_RELAY_HEAT, HIGH);
     digitalWrite(PIN_RELAY_HUM, HIGH);
     digitalWrite(PIN_RELAY_MOTOR, HIGH);
-    digitalWrite(PIN_RELAY_FAN, HIGH);
     Serial.println(F("OTA iniciada..."));
   });
   ArduinoOTA.begin();
@@ -2220,15 +2158,14 @@ void loop() {
   }
 
   // Actuadores solo tras estabilizar rail 5V (evita brown-out con puente JD-VCC)
-  if (!actuadoresListos && (ahora - millisArranque >= DELAY_ACTUADORES_MS)) {
+  if (!actuadoresListos && sensorValido && (ahora - millisArranque >= DELAY_ACTUADORES_MS)) {
     actuadoresListos = true;
     Serial.println(F("Actuadores habilitados."));
   }
 
-  // Controlar actuadores
+  // Controlar actuadores (solo tras sensor valido + delay)
   controlarCalefactor();
   controlarHumificador();
-  controlarVentilador();
   verificarVolteo(ahora);
 
   // Seguridad motor: forzar apagado si lleva mas de 30s encendido
@@ -2262,7 +2199,6 @@ void loop() {
       case TCMD_FORZAR_VOLTEO: forzarVolteoManual(); break;
       case TCMD_SAVE:         guardarEstado(); break;
       case TCMD_RESET:        borrarEstado(); break;
-      case TCMD_TOGGLE_VENTILADOR: toggleVentilador(); break;
       default: break;
     }
   }

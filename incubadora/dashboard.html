@@ -240,14 +240,6 @@
         <div class="status" id="hum-status">HUM: --</div>
       </div>
       <div class="card">
-        <h3>Ventilador</h3>
-        <div class="value cyan" id="fan">--</div>
-        <div class="target">Recirculación de aire</div>
-        <div class="controls">
-          <button id="fan-btn" onclick="sendCmd('fan')">--</button>
-        </div>
-      </div>
-      <div class="card">
         <h3>Sistema</h3>
         <div class="system-info">
           <div>WiFi: <span id="wifi">--</span></div>
@@ -431,12 +423,6 @@
         const hum = document.getElementById('hum-status');
         hum.textContent = 'HUM: ' + (d.humidor ? 'ON' : 'OFF');
         hum.className = 'status ' + (d.humidor ? 'ok' : 'bad');
-
-        document.getElementById('fan').textContent = d.fan ? 'ON' : 'OFF';
-        document.getElementById('fan').className = 'value ' + (d.fan ? 'cyan' : 'bad');
-        const fanBtn = document.getElementById('fan-btn');
-        fanBtn.textContent = d.fan ? 'Apagar ventilador' : 'Encender ventilador';
-        fanBtn.className = d.fan ? 'on' : 'off';
 
         document.getElementById('perfil-select').value = d.perfil_id;
         document.getElementById('perfil-nombre').textContent = d.perfil;
