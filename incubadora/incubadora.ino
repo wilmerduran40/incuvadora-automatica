@@ -149,6 +149,16 @@ int diaActual = 0;
 bool manualCal = false;
 bool manualHum = false;
 
+// ===================== DISPLAY / SENSOR INIT =====================
+bool displayOk = false;
+bool sensorCalentando = true;
+int sensorWarmupCount = 0;
+bool actuadoresListos = false;
+unsigned long millisArranque = 0;
+const unsigned long DELAY_ACTUADORES_MS = 500UL; // evita brown-out al boot con modulo relay
+const unsigned long STAGGER_RELAY_MS = 50UL;      // no activar varias bobinas a la vez
+unsigned long ultimoCambioRelay = 0;
+
 // ===================== HISTORICO PARA GRAFICOS =====================
 struct MuestraHistorico {
   unsigned long uptime;
@@ -238,7 +248,6 @@ TaskHandle_t telegramTaskHandle = NULL;
 // ===================== PERSISTENCIA (PROTECCION CORTE) =====================
 
 void guardarEstado() {
-  esp_task_wdt_reset();
   preferences.begin("incubadora", false);
 
   unsigned long uptimeTotal = uptimeAcumulado + millis();
@@ -263,7 +272,6 @@ void guardarEstado() {
   preferences.putBool("fan_on", estadoVentilador);
 
   preferences.end();
-  esp_task_wdt_reset();
   Serial.println(F("Estado guardado."));
 }
 
@@ -547,27 +555,63 @@ float obtenerHumMax() {
 
 // ===================== CONTROL DE ACTUADORES =====================
 
+// Relays activos en LOW. HIGH antes de pinMode evita pico de corriente al boot.
+void relaysInitSeguro() {
+  digitalWrite(PIN_RELAY_HEAT, HIGH);
+  digitalWrite(PIN_RELAY_HUM, HIGH);
+  digitalWrite(PIN_RELAY_MOTOR, HIGH);
+  digitalWrite(PIN_RELAY_FAN, HIGH);
+  pinMode(PIN_RELAY_HEAT, OUTPUT);
+  pinMode(PIN_RELAY_HUM, OUTPUT);
+  pinMode(PIN_RELAY_MOTOR, OUTPUT);
+  pinMode(PIN_RELAY_FAN, OUTPUT);
+  digitalWrite(PIN_RELAY_HEAT, HIGH);
+  digitalWrite(PIN_RELAY_HUM, HIGH);
+  digitalWrite(PIN_RELAY_MOTOR, HIGH);
+  digitalWrite(PIN_RELAY_FAN, HIGH);
+  estadoCalefactor = false;
+  estadoHumificador = false;
+  motorVolteando = false;
+  actuadoresListos = false;
+  ultimoCambioRelay = 0;
+}
+
+bool relayPuedeCambiar() {
+  unsigned long ahora = millis();
+  if (ultimoCambioRelay != 0 && (ahora - ultimoCambioRelay) < STAGGER_RELAY_MS) {
+    return false;
+  }
+  ultimoCambioRelay = ahora;
+  return true;
+}
+
 void controlarCalefactor() {
-  if (manualCal) return;
+  if (!actuadoresListos || manualCal) return;
 
   if (temperatura < tempMin && !estadoCalefactor) {
+    if (!relayPuedeCambiar()) return;
     digitalWrite(PIN_RELAY_HEAT, LOW);
     estadoCalefactor = true;
   } else if (temperatura > tempMax && estadoCalefactor) {
+    if (!relayPuedeCambiar()) return;
     digitalWrite(PIN_RELAY_HEAT, HIGH);
     estadoCalefactor = false;
   }
 }
 
 void controlarHumificador() {
+  if (!actuadoresListos) return;
+
   float humMin = obtenerHumMin();
   float humMax = obtenerHumMax();
 
   if (manualHum) {
-    if (humedad < humMin) {
+    if (humedad < humMin && !estadoHumificador) {
+      if (!relayPuedeCambiar()) return;
       digitalWrite(PIN_RELAY_HUM, LOW);
       estadoHumificador = true;
-    } else if (humedad > humMax) {
+    } else if (humedad > humMax && estadoHumificador) {
+      if (!relayPuedeCambiar()) return;
       digitalWrite(PIN_RELAY_HUM, HIGH);
       estadoHumificador = false;
     }
@@ -575,16 +619,19 @@ void controlarHumificador() {
   }
 
   if (humedad < humMin && !estadoHumificador) {
+    if (!relayPuedeCambiar()) return;
     digitalWrite(PIN_RELAY_HUM, LOW);
     estadoHumificador = true;
   } else if (humedad > humMax && estadoHumificador) {
+    if (!relayPuedeCambiar()) return;
     digitalWrite(PIN_RELAY_HUM, HIGH);
     estadoHumificador = false;
   }
 }
 
 void iniciarVolteo() {
-  if (motorVolteando || enLockdown) return;
+  if (!actuadoresListos || motorVolteando || enLockdown) return;
+  if (!relayPuedeCambiar()) return;
   motorVolteando = true;
   inicioVolteo = millis();
   digitalWrite(PIN_RELAY_MOTOR, LOW);
@@ -594,23 +641,29 @@ void detenerVolteo() {
   digitalWrite(PIN_RELAY_MOTOR, HIGH);
   motorVolteando = false;
   ultimoVolteo = obtenerUptimeTotal();
+  ultimoCambioRelay = millis();
 }
 
 void controlarVentilador() {
-  if (ventiladorManual) return;
+  if (!actuadoresListos || ventiladorManual) return;
+  // Reafirma estado sin stagger: si el pin ya esta asi, no hay pico de corriente
   digitalWrite(PIN_RELAY_FAN, estadoVentilador ? LOW : HIGH);
 }
 
 void encenderVentilador() {
   estadoVentilador = true;
   ventiladorManual = false;
+  if (!actuadoresListos) return;
   digitalWrite(PIN_RELAY_FAN, LOW);
+  ultimoCambioRelay = millis();
 }
 
 void apagarVentilador() {
   estadoVentilador = false;
   ventiladorManual = true;
+  if (!actuadoresListos) return;
   digitalWrite(PIN_RELAY_FAN, HIGH);
+  ultimoCambioRelay = millis();
 }
 
 void toggleVentilador() {
@@ -1114,7 +1167,6 @@ void processWebCommands() {
 void notificarTodos(const String& msg) {
   String resto = chatsPermitidos;
   while (resto.length() > 0) {
-    esp_task_wdt_reset();
     int coma = resto.indexOf(',');
     String id = (coma >= 0) ? resto.substring(0, coma) : resto;
     id.trim();
@@ -1129,7 +1181,6 @@ void notificarTodos(const String& msg) {
 
 void manejarMensajes(int num) {
   for (int i = 0; i < num; i++) {
-    esp_task_wdt_reset();
     yield();
     String chat = bot.messages[i].chat_id;
     if (chat.length() == 0) continue;
@@ -1236,7 +1287,6 @@ void procesarTelegram() {
   if (!botListo) return;
 
   if (!comandosRegistrados) {
-    esp_task_wdt_reset();
     String cmds = "[{\"command\":\"start\",\"description\":\"Bienvenida\"},{\"command\":\"help\",\"description\":\"Ayuda\"},{\"command\":\"info\",\"description\":\"Estado completo\"},{\"command\":\"temp\",\"description\":\"Fijar temp ej: temp 38\"},{\"command\":\"hum\",\"description\":\"Toggle humificador\"},{\"command\":\"cal\",\"description\":\"Toggle calefactor\"},{\"command\":\"volteo\",\"description\":\"Volteo forzado\"},{\"command\":\"guardar\",\"description\":\"Guardar estado\"},{\"command\":\"ota\",\"description\":\"Actualizar firmware (URL del bin)\"},{\"command\":\"reset\",\"description\":\"Reset estado\"}]";
     if (bot.setMyCommands(cmds)) {
       Serial.println(F("Comandos del bot registrados."));
@@ -1246,7 +1296,6 @@ void procesarTelegram() {
   }
 
   // Solo un lote de updates por ciclo para no bloquear el loop
-  esp_task_wdt_reset();
   int num = bot.getUpdates(bot.last_message_received + 1);
   if (num > 0) {
     manejarMensajes(num);
@@ -1255,7 +1304,6 @@ void procesarTelegram() {
 }
 
 void verificarAlertas() {
-  esp_task_wdt_reset();
   if (!botListo) return;
   if (temperatura <= 0.0) return;
 
@@ -1551,7 +1599,6 @@ void otaResponder(const String& chat, const String& msg) {
 }
 
 void hacerOTA(const String& url, const String& chat) {
-  esp_task_wdt_reset();
   if (WiFi.status() != WL_CONNECTED) {
     otaResponder(chat, "Error: sin WiFi.");
     return;
@@ -1609,7 +1656,6 @@ void hacerOTA(const String& url, const String& chat) {
     }
     total += n;
     if (millis() - ultimoWdt >= 1000) {
-      esp_task_wdt_reset();
       ultimoWdt = millis();
     }
     yield();
@@ -1630,7 +1676,7 @@ void hacerOTA(const String& url, const String& chat) {
 // ===================== PANTALLA TFT =====================
 
 void dibujarPantalla() {
-  esp_task_wdt_reset();
+  if (!displayOk) return;
   gfx->fillScreen(COLOR_BLACK);
 
   // ---- TITULO ----
@@ -1949,68 +1995,89 @@ void procesarSerial() {
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
 
   Serial.println(F("\n=== Incubadora Automatica v2.0 ==="));
 
-  // Watchdog: 10 segundos; si el loop se bloquea, reinicia
+  // Proteccion contra crash-loop por NVS corrupto tras cortes de energia
+  {
+    Preferences bootCtrl;
+    bootCtrl.begin("boot_ctrl", false);
+    int bootCount = bootCtrl.getInt("count", 0) + 1;
+    bootCtrl.putInt("count", bootCount);
+    bootCtrl.end();
+
+    if (bootCount > 3) {
+      Serial.println(F("CRASH-LOOP detectado (>3 reinicios). Borrando NVS..."));
+      Preferences wipe;
+      wipe.begin("incubadora", false);
+      wipe.clear();
+      wipe.end();
+      bootCtrl.begin("boot_ctrl", false);
+      bootCtrl.putInt("count", 0);
+      bootCtrl.end();
+      Serial.println(F("NVS limpiado. Arrancando con valores por defecto."));
+    }
+  }
+
+  // Relays OFF cuanto antes (HIGH antes de OUTPUT evita pico de corriente al boot)
+  relaysInitSeguro();
+  millisArranque = millis();
+
+  // Watchdog: Arduino ya inicializa el TWDT. Reconfigurar para cubrir ambos cores.
   esp_task_wdt_config_t twdt_config = {};
-  twdt_config.timeout_ms = 10000;
+  twdt_config.timeout_ms = 30000;
   twdt_config.idle_core_mask = (1 << portNUM_PROCESSORS) - 1;
   twdt_config.trigger_panic = true;
-  if (esp_task_wdt_init(&twdt_config) == ESP_OK) {
-    esp_task_wdt_add(NULL);
-    Serial.println(F("Watchdog activado (10s)."));
+  esp_task_wdt_reconfigure(&twdt_config);
+  Serial.println(F("Watchdog reconfigurado (30s, ambos cores)."));
+  Serial.println(F("Relays en OFF (arranque seguro)."));
+
+  // Pantalla con retry (max 2 intentos, no bloquea el sistema si falla)
+  for (int intento = 0; intento < 2; intento++) {
+    esp_task_wdt_reset();
+    if (gfx->begin()) {
+      displayOk = true;
+      break;
+    }
+    Serial.printf("Intento display %d fallido, reintentando...\n", intento + 1);
+    delay(500);
+  }
+  if (displayOk) {
+    Serial.println(F("Pantalla TFT OK"));
   } else {
-    Serial.println(F("Watchdog NO pudo activarse."));
+    Serial.println(F("ERROR: Pantalla TFT no detectada tras 2 intentos. Continuando sin display."));
   }
 
-  // Pines relay
-  pinMode(PIN_RELAY_HEAT, OUTPUT);
-  pinMode(PIN_RELAY_HUM, OUTPUT);
-  pinMode(PIN_RELAY_MOTOR, OUTPUT);
-  pinMode(PIN_RELAY_FAN, OUTPUT);
-
-  digitalWrite(PIN_RELAY_HEAT, HIGH);
-  digitalWrite(PIN_RELAY_HUM, HIGH);
-  digitalWrite(PIN_RELAY_MOTOR, HIGH);
-  digitalWrite(PIN_RELAY_FAN, estadoVentilador ? LOW : HIGH);
-
-  // Pantalla
-  if (!gfx->begin()) {
-    Serial.println(F("ERROR: Pantalla TFT no detectada!"));
-    while (true) { delay(10000); }
-  }
-  Serial.println(F("Pantalla TFT OK"));
-
-  gfx->fillScreen(COLOR_BLACK);
-  gfx->setTextColor(COLOR_GREEN);
-  gfx->setCursor(10, 30);
-  gfx->setTextSize(4);
-  gfx->println("AVICORD");
-  gfx->setCursor(15, 80);
-  gfx->setTextSize(2);
-  gfx->println("Incubadora v2.0");
-  gfx->setCursor(15, 110);
-  gfx->setTextSize(2);
-  gfx->println("Iniciando...");
-  delay(2000);
-
-  // Sensor
-  am2302.begin();
-  delay(3000);
-  for (int i = 0; i < 5; i++) {
-    am2302.read();
-    delay(2000);
+  // Splash screen (solo si display disponible)
+  if (displayOk) {
+    gfx->fillScreen(COLOR_BLACK);
+    gfx->setTextColor(COLOR_GREEN);
+    gfx->setCursor(10, 30);
+    gfx->setTextSize(4);
+    gfx->println("AVICORD");
+    gfx->setCursor(15, 80);
+    gfx->setTextSize(2);
+    gfx->println("Incubadora v2.0");
+    gfx->setCursor(15, 110);
+    gfx->setTextSize(2);
+    gfx->println("Iniciando...");
+    delay(200);
   }
 
-  // Cargar estado persistente y config de red
+  // Cargar estado persistente y config de red (antes del sensor para usar settings)
   cargarEstado();
   cargarRed();
 
   // Calcular dia con uptime acumulado
   calcularDia();
   verificarFase();
+
+  // Sensor DHT22: init + warmup no-bloqueante
+  am2302.begin();
+  am2302.read();
+  esp_task_wdt_reset();
+  sensorWarmupCount = 1;
+  sensorCalentando = true;
 
   // Inicializar timestamps
   ultimoVolteo = obtenerUptimeTotal();
@@ -2103,12 +2170,21 @@ void setup() {
 // ===================== LOOP =====================
 
 void loop() {
-  esp_task_wdt_reset();
   unsigned long ahora = millis();
 
   // Actualizar uptime acumulado
   uptimeAcumulado += (ahora - millisEnUltimoGuardado);
   millisEnUltimoGuardado = ahora;
+
+  // Limpiar contador de crash-loop tras 10s de uptime estable
+  static bool bootCtrlCleared = false;
+  if (!bootCtrlCleared && uptimeAcumulado > 10000UL) {
+    Preferences bootCtrl;
+    bootCtrl.begin("boot_ctrl", false);
+    bootCtrl.putInt("count", 0);
+    bootCtrl.end();
+    bootCtrlCleared = true;
+  }
 
   // Gestionar WiFi
   gestionarWifi();
@@ -2124,6 +2200,16 @@ void loop() {
   }
   botListo = wifiOk && tiempoSincronizado && telegramToken.length() > 0;
 
+  // Completar warmup del sensor DHT22 en background (1 lectura por ciclo)
+  if (sensorCalentando && sensorWarmupCount < 5) {
+    am2302.read();
+    sensorWarmupCount++;
+    if (sensorWarmupCount >= 5) {
+      sensorCalentando = false;
+      Serial.println(F("Sensor DHT22 listo."));
+    }
+  }
+
   // Leer sensor y calcular fase
   if (ahora - ultimaLectura >= INTERVALO_LECTURA) {
     leerSensor();
@@ -2131,6 +2217,12 @@ void loop() {
     verificarFase();
     guardarMuestraHistorico(ahora);
     ultimaLectura = ahora;
+  }
+
+  // Actuadores solo tras estabilizar rail 5V (evita brown-out con puente JD-VCC)
+  if (!actuadoresListos && (ahora - millisArranque >= DELAY_ACTUADORES_MS)) {
+    actuadoresListos = true;
+    Serial.println(F("Actuadores habilitados."));
   }
 
   // Controlar actuadores
