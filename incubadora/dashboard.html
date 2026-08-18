@@ -171,30 +171,6 @@
       display: none;
       z-index: 100;
     }
-    .chart-container {
-      width: 100%;
-      height: 260px;
-      background: #0f1115;
-      border-radius: 12px;
-      padding: 10px;
-    }
-    svg { width: 100%; height: 100%; }
-    .legend {
-      display: flex;
-      gap: 16px;
-      font-size: 0.85rem;
-      margin-bottom: 10px;
-    }
-    .legend span::before {
-      content: '';
-      display: inline-block;
-      width: 12px;
-      height: 12px;
-      border-radius: 2px;
-      margin-right: 4px;
-    }
-    .legend .temp::before { background: var(--red); }
-    .legend .hum::before { background: var(--cyan); }
     @media (max-width: 400px) {
       .grid { grid-template-columns: 1fr; }
       .system-info { grid-template-columns: 1fr; }
@@ -207,7 +183,6 @@
 
   <div class="tabs">
     <button class="tab-btn active" onclick="showTab('estado')">Estado</button>
-    <button class="tab-btn" onclick="showTab('graficos')">Gráficos</button>
     <button class="tab-btn" onclick="showTab('config')">Configuración</button>
   </div>
 
@@ -282,23 +257,6 @@
     <div class="card full">
       <h3>Última actualización</h3>
       <div class="target" id="last-update">--</div>
-    </div>
-  </div>
-
-  <div id="graficos" class="tab-content">
-    <div class="card full">
-      <h3>Histórico (últimas 24h)</h3>
-      <div class="legend">
-        <span class="temp">Temperatura (°C)</span>
-        <span class="hum">Humedad (%)</span>
-      </div>
-      <div class="chart-container">
-        <svg id="chart" viewBox="0 0 600 240" preserveAspectRatio="none">
-          <g id="chart-grid"></g>
-          <path id="chart-temp" fill="none" stroke="#ff1744" stroke-width="2"></path>
-          <path id="chart-hum" fill="none" stroke="#00e5ff" stroke-width="2"></path>
-        </svg>
-      </div>
     </div>
   </div>
 
@@ -394,7 +352,6 @@
       document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
       document.getElementById(id).classList.add('active');
       event.target.classList.add('active');
-      if (id === 'graficos') cargarHistorico();
     }
 
     function toast(msg) {
@@ -521,54 +478,6 @@
         setTimeout(update, 300);
       } catch (e) {
         toast('Error aplicando personalizado');
-      }
-    }
-
-    async function cargarHistorico() {
-      try {
-        const res = await fetch('/api/history');
-        const data = await res.json();
-        dibujarGrafico(data);
-      } catch (e) {
-        console.error('Error cargando histórico:', e);
-      }
-    }
-
-    function dibujarGrafico(data) {
-      if (data.length < 2) return;
-      const svg = document.getElementById('chart');
-      const w = 600, h = 240, pad = 30;
-      const gw = w - pad * 2, gh = h - pad * 2;
-
-      let minT = 30, maxT = 45, minH = 20, maxH = 90;
-      data.forEach(p => {
-        if (p.temp < minT) minT = p.temp;
-        if (p.temp > maxT) maxT = p.temp;
-        if (p.hum < minH) minH = p.hum;
-        if (p.hum > maxH) maxH = p.hum;
-      });
-      minT = Math.floor(minT); maxT = Math.ceil(maxT);
-      minH = Math.floor(minH / 10) * 10; maxH = Math.ceil(maxH / 10) * 10;
-
-      const t0 = data[0].t, tn = data[data.length - 1].t;
-      const dx = tn === t0 ? 0 : gw / (tn - t0);
-
-      const pt = (x, y, min, max) => {
-        const px = pad + (x - t0) * dx;
-        const py = pad + gh - ((y - min) / (max - min)) * gh;
-        return px.toFixed(1) + ',' + py.toFixed(1);
-      };
-
-      document.getElementById('chart-temp').setAttribute('d', 'M ' + data.map(p => pt(p.t, p.temp, minT, maxT)).join(' L '));
-      document.getElementById('chart-hum').setAttribute('d', 'M ' + data.map(p => pt(p.t, p.hum, minH, maxH)).join(' L '));
-
-      const grid = document.getElementById('chart-grid');
-      grid.innerHTML = '';
-      for (let i = 0; i <= 4; i++) {
-        const y = pad + (gh * i) / 4;
-        grid.innerHTML += `<line x1="${pad}" y1="${y}" x2="${w-pad}" y2="${y}" stroke="#2a2f36" stroke-width="1"/>`;
-        grid.innerHTML += `<text x="5" y="${y+4}" fill="#888" font-size="10">${(maxT - (maxT-minT)*i/4).toFixed(1)}</text>`;
-        grid.innerHTML += `<text x="${w-pad+4}" y="${y+4}" fill="#888" font-size="10">${(maxH - (maxH-minH)*i/4).toFixed(0)}</text>`;
       }
     }
 

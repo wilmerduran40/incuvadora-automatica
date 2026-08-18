@@ -12,6 +12,7 @@
 IN4 DEL MODULO RELAY LIBRE 
 
 
+
 ### Pantalla TFT ST7789 (170x320 IPS)
 
 | Pin Pantalla | Pin ESP32 | Funcion       |
