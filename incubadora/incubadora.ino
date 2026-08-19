@@ -14,7 +14,6 @@
 #include <UniversalTelegramBot.h>
 #include <ArduinoJson.h>
 #include <time.h>
-#include <esp_task_wdt.h>
 
 // ===================== PINES =====================
 constexpr unsigned int PIN_DHT22       = 4;
@@ -37,6 +36,7 @@ String wifiPass = "";
 String telegramToken = "";
 String chatsPermitidos = "";
 unsigned long ultimoIntentoWifi = 0;
+unsigned long ultimoIntentoNtp = 0;
 bool tiempoSincronizado = false;
 bool botListo = false;
 bool comandosRegistrados = false;
@@ -58,11 +58,14 @@ bool alarmaTemp = false;
 const unsigned long INTERVALO_LECTURA    = 2000UL;
 const unsigned long INTERVALO_PANTALLA   = 1000UL;
 const unsigned long INTERVALO_GUARDADO   = 60000UL;
-const unsigned long INTERVALO_BOT        = 30000UL;
+const unsigned long INTERVALO_BOT        = 5000UL;
 const unsigned long INTERVALO_RECONEXION_WIFI = 30000UL;
-const unsigned long DELAY_ACTUADORES_MS  = 2000UL;
+const unsigned long DELAY_ACTUADORES_MS  = 8000UL;
 const unsigned long STAGGER_RELAY_MS     = 150UL;
 const unsigned long MOTOR_TIMEOUT_MS     = 30000UL;
+const unsigned long DEBOUNCE_ACTUADOR_MS = 10000UL;
+const unsigned long MIN_ON_HUM_MS        = 60000UL;
+const unsigned long COOLDOWN_ALERTA_MS   = 60000UL;
 const int MAX_ERRORES_SENSOR             = 5;
 
 // ===================== PARAMETROS PERSONALIZADOS =====================
@@ -103,9 +106,13 @@ bool manualCal = false;
 bool manualHum = false;
 bool sensorValido = false;
 int erroresSensor = 0;
+unsigned long ultimoCambioCal = 0;
+unsigned long ultimoCambioHum = 0;
+unsigned long ultimaAlertaEnviada = 0;
 
 bool displayOk = false;
 bool actuadoresListos = false;
+bool wifiEstable = false;
 
 // ===================== PERSISTENCIA =====================
 void guardarEstado() {
@@ -210,8 +217,16 @@ void gestionarWifi() {
   static bool ntpArrancado = false;
   if (WiFi.status() == WL_CONNECTED) {
     if (!ntpArrancado) {
-      configTime(0, 0, "pool.ntp.org");
+      configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
       ntpArrancado = true;
+      ultimoIntentoNtp = millis();
+      Serial.println(F("NTP: intentando sincronizar..."));
+    }
+    // Reintentar NTP si no sincronizo tras 60s
+    if (!tiempoSincronizado && (millis() - ultimoIntentoNtp > 60000)) {
+      configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+      ultimoIntentoNtp = millis();
+      Serial.println(F("NTP: reintentando sincronizacion..."));
     }
     ultimoIntentoWifi = millis();
     return;
@@ -358,29 +373,60 @@ void apagarActuadoresSeguro() {
 
 void controlarCalefactor() {
   if (!actuadoresListos || !sensorValido || manualCal) return;
+  unsigned long ahora = millis();
   if (temperatura < tempMin && !estadoCalefactor) {
     if (!relayPuedeCambiar()) return;
+    if (ahora - ultimoCambioCal < DEBOUNCE_ACTUADOR_MS) return;
+    Serial.print(F("RELAY CAL ON @ "));
+    Serial.print(temperatura, 1);
+    Serial.print(F("C (<"));
+    Serial.print(tempMin, 1);
+    Serial.println(F("C)"));
     digitalWrite(PIN_RELAY_HEAT, LOW);
     estadoCalefactor = true;
+    ultimoCambioCal = ahora;
   } else if (temperatura > tempMax && estadoCalefactor) {
     if (!relayPuedeCambiar()) return;
+    if (ahora - ultimoCambioCal < DEBOUNCE_ACTUADOR_MS) return;
+    Serial.print(F("RELAY CAL OFF @ "));
+    Serial.print(temperatura, 1);
+    Serial.print(F("C (>"));
+    Serial.print(tempMax, 1);
+    Serial.println(F("C)"));
     digitalWrite(PIN_RELAY_HEAT, HIGH);
     estadoCalefactor = false;
+    ultimoCambioCal = ahora;
   }
 }
 
 void controlarHumificador() {
-  if (!actuadoresListos || !sensorValido) return;
+  if (!actuadoresListos || !sensorValido || manualHum) return;
   float humMin = obtenerHumMin();
   float humMax = obtenerHumMax();
+  unsigned long ahora = millis();
   if (humedad < humMin && !estadoHumificador) {
     if (!relayPuedeCambiar()) return;
+    if (ahora - ultimoCambioHum < DEBOUNCE_ACTUADOR_MS) return;
+    Serial.print(F("RELAY HUM ON @ "));
+    Serial.print(humedad, 1);
+    Serial.print(F("% (<"));
+    Serial.print(humMin, 1);
+    Serial.println(F("%)"));
     digitalWrite(PIN_RELAY_HUM, LOW);
     estadoHumificador = true;
+    ultimoCambioHum = ahora;
   } else if (humedad > humMax && estadoHumificador) {
     if (!relayPuedeCambiar()) return;
+    if (ahora - ultimoCambioHum < DEBOUNCE_ACTUADOR_MS) return;
+    if (ahora - ultimoCambioHum < MIN_ON_HUM_MS) return;
+    Serial.print(F("RELAY HUM OFF @ "));
+    Serial.print(humedad, 1);
+    Serial.print(F("% (>("));
+    Serial.print(humMax, 1);
+    Serial.println(F("%)"));
     digitalWrite(PIN_RELAY_HUM, HIGH);
     estadoHumificador = false;
+    ultimoCambioHum = ahora;
   }
 }
 
@@ -483,11 +529,16 @@ void bajarTemp() {
 
 void toggleHumManual() {
   manualHum = !manualHum;
-  Serial.print(F("Humificador manual: "));
-  Serial.println(manualHum ? "ON" : "OFF");
-  if (!manualHum) {
+  Serial.print(F("HUM MANUAL: "));
+  Serial.print(manualHum ? "ON" : "OFF");
+  if (manualHum) {
+    digitalWrite(PIN_RELAY_HUM, LOW);
+    estadoHumificador = true;
+    Serial.println(F(" → RELAY LOW (encendido)"));
+  } else {
     digitalWrite(PIN_RELAY_HUM, HIGH);
     estadoHumificador = false;
+    Serial.println(F(" → RELAY HIGH (apagado)"));
   }
 }
 
@@ -495,7 +546,10 @@ void toggleCalManual() {
   manualCal = !manualCal;
   Serial.print(F("Calefactor manual: "));
   Serial.println(manualCal ? "ON" : "OFF");
-  if (!manualCal) {
+  if (manualCal) {
+    digitalWrite(PIN_RELAY_HEAT, LOW);
+    estadoCalefactor = true;
+  } else {
     digitalWrite(PIN_RELAY_HEAT, HIGH);
     estadoCalefactor = false;
   }
@@ -579,8 +633,38 @@ String obtenerAyudaTelegram() {
   s += "COMANDOS:\n";
   s += "info - estado completo\n";
   s += "help - esta ayuda\n";
-  s += "id - tu chat_id";
+  s += "id - tu chat_id\n\n";
+  s += "Usa los botones para controlar la incubadora.";
   return s;
+}
+
+String obtenerTecladoMenu() {
+  String kb = "[[";
+  kb += "{\"text\":\"Temp +0.5\",\"callback_data\":\"temp_up\"},";
+  kb += "{\"text\":\"Temp -0.5\",\"callback_data\":\"temp_down\"}";
+  kb += "],[";
+  kb += "{\"text\":\"Calefactor\",\"callback_data\":\"cal_toggle\"},";
+  kb += "{\"text\":\"Humificador\",\"callback_data\":\"hum_toggle\"}";
+  kb += "],[";
+  kb += "{\"text\":\"Volteo\",\"callback_data\":\"volteo\"},";
+  kb += "{\"text\":\"Info\",\"callback_data\":\"info\"}";
+  kb += "],[";
+  kb += "{\"text\":\"Reiniciar ciclo\",\"callback_data\":\"reset_cycle\"},";
+  kb += "{\"text\":\"Parametros\",\"callback_data\":\"params\"}";
+  kb += "]]";
+  return kb;
+}
+
+void enviarMenuTelegram(const String& chat, int msgId = 0) {
+  String estado = "INCUBADORA\n";
+  estado += "Temp: " + String(temperatura, 1) + "C (obj " + String(tempObjetivo, 1) + "C)\n";
+  estado += "Hum: " + String(humedad, 0) + "%\n";
+  estado += "Cal: " + String(estadoCalefactor ? "ON" : "OFF") + " | Hum: " + String(estadoHumificador ? "ON" : "OFF") + "\n";
+  estado += "Dia: " + String(diaActual) + "/" + String(diasTotal);
+  if (motorVolteando) estado += " | Motor: GIRANDO";
+  estado += "\n\nQue quieres hacer?";
+
+  bot.sendMessageWithInlineKeyboard(chat, estado, "", obtenerTecladoMenu(), msgId);
 }
 
 void mostrarAyudaSerial() {
@@ -629,10 +713,74 @@ void notificarTodos(const String& msg) {
   }
 }
 
+void procesarCallbackBoton(const String& chat, const String& data, int msgId) {
+  if (!chatPermitido(chat)) {
+    bot.sendMessage(chat, "No autorizado.", "");
+    return;
+  }
+
+  String respuesta = "";
+
+  if (data == "temp_up") {
+    tempObjetivo += 0.5;
+    respuesta = "Temp objetivo: " + String(tempObjetivo, 1) + " C";
+  } else if (data == "temp_down") {
+    tempObjetivo -= 0.5;
+    respuesta = "Temp objetivo: " + String(tempObjetivo, 1) + " C";
+  } else if (data == "cal_toggle") {
+    toggleCalManual();
+    respuesta = "Calefactor manual: " + String(manualCal ? "ON" : "OFF");
+  } else if (data == "hum_toggle") {
+    toggleHumManual();
+    respuesta = "Humificador manual: " + String(manualHum ? "ON" : "OFF");
+  } else if (data == "volteo") {
+    if (enLockdown) {
+      respuesta = "Volteo bloqueado en LOCKDOWN.";
+    } else {
+      iniciarVolteo();
+      respuesta = "Volteo forzado...";
+    }
+  } else if (data == "info") {
+    bot.sendMessage(chat, obtenerInfoTelegram(), "");
+    enviarMenuTelegram(chat, msgId);
+    return;
+  } else if (data == "params") {
+    String p = "PARAMETROS:\n";
+    p += "Temp obj: " + String(tempObjetivo, 1) + "C\n";
+    p += "Temp min: " + String(tempMin, 1) + "C\n";
+    p += "Temp max: " + String(tempMax, 1) + "C\n";
+    p += "Hum dev: " + String(humMinDesarrollo, 0) + "-" + String(humMaxDesarrollo, 0) + "%\n";
+    p += "Hum lock: " + String(humMinLockdown, 0) + "-" + String(humMaxLockdown, 0) + "%\n";
+    p += "Dias: " + String(diasTotal) + " | Lock: dia " + String(diaLockdown) + "\n";
+    p += "Volteo: " + String(intervaloVolteoMs / 3600000.0, 1) + "h / " + String(duracionVolteoMs / 1000.0, 0) + "s";
+    bot.sendMessage(chat, p, "");
+    enviarMenuTelegram(chat, msgId);
+    return;
+  } else if (data == "menu") {
+    enviarMenuTelegram(chat, msgId);
+    return;
+  } else {
+    return;
+  }
+
+  enviarMenuTelegram(chat, msgId);
+}
+
 void manejarMensajes(int num) {
   for (int i = 0; i < num; i++) {
     String chat = bot.messages[i].chat_id;
     if (chat.length() == 0) continue;
+
+    // Manejar callback queries (botones inline)
+    if (bot.messages[i].type == "callback_query") {
+      String data = bot.messages[i].text;
+      int msgId = bot.messages[i].message_id;
+      bot.answerCallbackQuery(bot.messages[i].query_id);
+      procesarCallbackBoton(chat, data, msgId);
+      continue;
+    }
+
+    // Manejar mensajes de texto
     String texto = bot.messages[i].text;
     texto.trim();
     String textoLow = texto;
@@ -646,10 +794,14 @@ void manejarMensajes(int num) {
     if (cmd == "start") {
       if (chatsPermitidos.length() == 0) agregarChat(chat);
       if (chatPermitido(chat)) {
-        bot.sendMessage(chat, "Hola! Bot de incubadora.\n\n" + obtenerAyudaTelegram(), "");
+        enviarMenuTelegram(chat);
       } else {
         bot.sendMessage(chat, "No autorizado. Pide acceso: allow " + chat, "");
       }
+      continue;
+    }
+    if (cmd == "menu") {
+      if (chatPermitido(chat)) enviarMenuTelegram(chat);
       continue;
     }
     if (cmd == "id") {
@@ -666,8 +818,9 @@ void manejarMensajes(int num) {
     }
     if (cmd == "info" || cmd == "estado" || cmd == "status") {
       bot.sendMessage(chat, obtenerInfoTelegram(), "");
+      enviarMenuTelegram(chat);
     } else {
-      bot.sendMessage(chat, "Comando desconocido. Usa: help", "");
+      bot.sendMessage(chat, "Comando desconocido. Usa /menu", "");
     }
   }
 }
@@ -677,7 +830,7 @@ void procesarTelegram() {
   if (millis() - ultimoBot < INTERVALO_BOT) return;
   ultimoBot = millis();
   if (!comandosRegistrados) {
-    String cmds = "[{\"command\":\"start\",\"description\":\"Bienvenida\"},{\"command\":\"help\",\"description\":\"Ayuda\"},{\"command\":\"info\",\"description\":\"Estado completo\"}]";
+    String cmds = "[{\"command\":\"start\",\"description\":\"Iniciar\"},{\"command\":\"menu\",\"description\":\"Menu principal\"},{\"command\":\"info\",\"description\":\"Estado completo\"},{\"command\":\"help\",\"description\":\"Ayuda\"},{\"command\":\"id\",\"description\":\"Tu chat_id\"}]";
     bot.setMyCommands(cmds);
     comandosRegistrados = true;
   }
@@ -689,9 +842,12 @@ void procesarTelegram() {
 
 void verificarAlertas() {
   if (!botListo || temperatura <= 0.0 || !sensorValido) return;
+  unsigned long ahora = millis();
   bool fuera = (temperatura < tempMin || temperatura > tempMax);
   if (fuera && !alarmaTemp) {
+    if (ahora - ultimaAlertaEnviada < COOLDOWN_ALERTA_MS) return;
     alarmaTemp = true;
+    ultimaAlertaEnviada = ahora;
     notificarTodos("ALERTA: temperatura fuera de rango: " + String(temperatura, 1) + "C");
   } else if (!fuera && alarmaTemp) {
     alarmaTemp = false;
@@ -1056,20 +1212,28 @@ void setup() {
   millisArranque = millis();
 
   Serial.begin(115200);
+  delay(100);
   Serial.println(F("\n=== Incubadora Automatica - Minima Estable ==="));
   Serial.println(F("Relays OFF (arranque seguro)."));
 
-  // Watchdog a 5 segundos
-  esp_task_wdt_config_t twdt_config = {};
-  twdt_config.timeout_ms = 5000;
-  twdt_config.idle_core_mask = (1 << portNUM_PROCESSORS) - 1;
-  twdt_config.trigger_panic = true;
-  esp_task_wdt_reconfigure(&twdt_config);
-  Serial.println(F("Watchdog 5s activo."));
+  // Diagnosticar motivo del reinicio
+  esp_reset_reason_t razon = esp_reset_reason();
+  Serial.print(F("Razon de reset: "));
+  switch (razon) {
+    case ESP_RST_POWERON:   Serial.println(F("ENCENDIDO / power-on")); break;
+    case ESP_RST_EXT:       Serial.println(F("RESET EXTERNO (boton pin)")); break;
+    case ESP_RST_SW:        Serial.println(F("SOFTWARE (ESP.restart())")); break;
+    case ESP_RST_PANIC:     Serial.println(F("PANIC / exception")); break;
+    case ESP_RST_INT_WDT:   Serial.println(F("WATCHDOG INTERNO")); break;
+    case ESP_RST_TASK_WDT:  Serial.println(F("WATCHDOG DE TAREA (WDT)")); break;
+    case ESP_RST_WDT:       Serial.println(F("WATCHDOG (otro)")); break;
+    case ESP_RST_BROWNOUT:  Serial.println(F(">>> BROWNOUT (bajo voltaje) <<<")); break;
+    case ESP_RST_SDIO:      Serial.println(F("SDIO")); break;
+    default:                Serial.println(F("DESCONOCIDO")); break;
+  }
 
   // Pantalla con retry
   for (int intento = 0; intento < 2; intento++) {
-    esp_task_wdt_reset();
     if (gfx->begin()) {
       displayOk = true;
       break;
@@ -1144,7 +1308,6 @@ void setup() {
 // ===================== LOOP =====================
 void loop() {
   unsigned long ahora = millis();
-  esp_task_wdt_reset();
 
   uptimeAcumulado += (ahora - millisEnUltimoGuardado);
   millisEnUltimoGuardado = ahora;
@@ -1154,12 +1317,30 @@ void loop() {
   bool wifiOk = (WiFi.status() == WL_CONNECTED);
   if (wifiOk && !tiempoSincronizado) {
     time_t now = time(nullptr);
+    // Diagnosticar NTP cada 10 segundos
+    static unsigned long ultimoDiagNtp = 0;
+    if (millis() - ultimoDiagNtp > 10000) {
+      Serial.print(F("NTP: hora = "));
+      Serial.println((unsigned long)now);
+      ultimoDiagNtp = millis();
+    }
     if (now > 24 * 3600) {
       tiempoSincronizado = true;
       Serial.println(F("Hora NTP sincronizada."));
     }
   }
   botListo = wifiOk && tiempoSincronizado && telegramToken.length() > 0;
+
+  // Marcar WiFi como estable: conecto O ya pasaron 15s desde arranque (sin WiFi)
+  if (!wifiEstable) {
+    if (wifiOk) {
+      wifiEstable = true;
+      Serial.println(F("WiFi conectado. Relays habilitados pronto."));
+    } else if (ahora - millisArranque > 15000) {
+      wifiEstable = true;
+      Serial.println(F("WiFi sin conexion tras 15s. Relays habilitados."));
+    }
+  }
 
   if (ahora - ultimaLectura >= INTERVALO_LECTURA) {
     leerSensor();
@@ -1168,7 +1349,8 @@ void loop() {
     ultimaLectura = ahora;
   }
 
-  if (!actuadoresListos && sensorValido && (ahora - millisArranque >= DELAY_ACTUADORES_MS)) {
+  // Actuadores solo si: sensor OK + tiempo suficiente + WiFi estable
+  if (!actuadoresListos && sensorValido && wifiEstable && (ahora - millisArranque >= DELAY_ACTUADORES_MS)) {
     actuadoresListos = true;
     Serial.println(F("Actuadores habilitados."));
   }
@@ -1192,8 +1374,11 @@ void loop() {
     ultimaPantalla = ahora;
   }
 
-  procesarTelegram();
-  verificarAlertas();
+  // Guard de tiempo: solo procesar red si quedan >= 2s de margen antes del watchdog
+  if ((millis() - ahora) < 8000) {
+    procesarTelegram();
+    verificarAlertas();
+  }
 
   procesarSerial();
 }
